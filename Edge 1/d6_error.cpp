@@ -353,6 +353,7 @@ public:
                 cerr<<"[TCP error] "<<e.what()<<endl;
             }
             if(client_fd!=-1){
+                // 这句话的效果是这个文件描述符的引用次数减少一次，并不是直接关闭客户端
                 ::close(client_fd);
             }
         }        
