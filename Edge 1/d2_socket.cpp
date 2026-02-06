@@ -130,6 +130,20 @@ public:
     ssize_t send_udp(const string &str,const sockaddr_in &client_addr){
         return ::sendto(fd,str.c_str(),str.size(),0,(const sockaddr*)&client_addr,sizeof(client_addr));
     }
+
+    // 客户端，客户端接受和发出信息也使用服务器的函数，效果上是一样的。
+    void connect(const string& server_ip,uint16_t server_port){
+        sockaddr_in serv_addr{};
+        serv_addr.sin_family=AF_INET;
+        serv_addr.sin_port=htons(server_port);
+        serv_addr.sin_addr.s_addr=inet_addr(server_ip.c_str());
+
+        if(::connect(fd,(sockaddr*)&serv_addr,sizeof(serv_addr))<0){
+            throw runtime_error("connect() failed: "+string(strerror(errno)));
+        }
+
+        cout<<"[Client] connected to "<<server_ip<<" : "<<server_port<<endl;
+    }
 };
 
 int main()
