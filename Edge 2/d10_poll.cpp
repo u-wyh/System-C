@@ -6,6 +6,8 @@
 #include<cstring>
 #include<iostream>
 #include<fcntl.h>
+#include<poll.h>
+#include<algorithm>
 
 using namespace std;
 
@@ -37,7 +39,6 @@ int create_listen_socket(int port){
     return fd;
 }
 
-
 void handle_client(int client_fd){
     char buffer[1024];
 
@@ -67,7 +68,7 @@ void handle_client(int client_fd){
     }
 }
 
-void run_select_server(int port){
+void run_poll_server(int port){
     int listen_fd=create_listen_socket(port);
     if(listen_fd<0){
         return;
@@ -76,32 +77,28 @@ void run_select_server(int port){
     // 设置为非阻塞式
     fcntl(listen_fd,F_SETFL,O_NONBLOCK);
 
-    fd_set master_set,ready_set;
-    int max_fd=listen_fd;
-    FD_ZERO(&master_set);
-    FD_SET(listen_fd,&master_set);
+    vector<pollfd>fds;
+    fds.push_back({listen_fd,POLLIN,0});
 
     while(true){
-        ready_set=master_set;
-        int ready_count=select(max_fd+1,&ready_set,nullptr,nullptr,nullptr);
-        if(ready_count<0){
-            perror("select error");
+        int ret=poll(fds.data(),fds.size(),-1);
+        if(ret<0){
+            perror("poll error");
             break;
         }
 
-        for(int fd=0;fd<=max_fd&&ready_count>0;fd++){
-            if(FD_ISSET(fd,&ready_set)){
-                ready_count--;
+        for(size_t i=0;i<fds.size()&&ret>0;i++){
+            if(fds[i].revents&POLLIN){
+                ret--;
 
-                if(fd==listen_fd){
-                    // 表示有新连接建立
+                if(fds[i].fd==listen_fd){
                     while(true){
+                        // 表示有新连接建立
                         sockaddr_in client_addr{};
                         socklen_t len=sizeof(client_addr);
 
-                        int client_fd=accept(fd,(sockaddr*)&client_addr,&len);
+                        int client_fd=accept(listen_fd,(sockaddr*)&client_addr,&len);
                         if(client_fd<0){
-                            // 如果已经建立连接的队列空了，那么直接跳出
                             if(errno==EAGAIN||errno==EWOULDBLOCK){
                                 break;
                             }
@@ -110,10 +107,7 @@ void run_select_server(int port){
                         }
 
                         fcntl(client_fd,F_SETFL,O_NONBLOCK);
-                        FD_SET(client_fd,&master_set);
-                        if(client_fd>max_fd){
-                            max_fd=client_fd;
-                        }
+                        fds.push_back({client_fd,POLLIN,0});
 
                         char ip[INET_ADDRSTRLEN];
                         inet_ntop(AF_INET,&client_addr.sin_addr,ip,sizeof(ip));
@@ -123,23 +117,28 @@ void run_select_server(int port){
                     }
                 }
                 else{
+                    int fd=fds[i].fd;
                     handle_client(fd);
+                    if(fcntl(fd,F_GETFL)==-1){
+                        fds[i].fd=-1;
+                    }
                 }
             }
         }
+
+        fds.erase(remove_if(fds.begin(),fds.end(),[](const pollfd &p){return p.fd<0;}),fds.end());
     }
 
-    for(int fd=0;fd<=max_fd;fd++){
-        if(FD_ISSET(fd,&master_set)){
-            close(fd);
+    for(auto &pfd:fds){
+        if(pfd.fd>=0){
+            close(pfd.fd);
         }
     }
 
     close(listen_fd);
 }
 
-int main()
-{
-    run_select_server(8080);
+int main(){
+    run_poll_server(8080);
     return 0;
 }

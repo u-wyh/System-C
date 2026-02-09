@@ -95,3 +95,14 @@ select 模型：内存压力小，几乎不依赖 Swap
 select 模型：线程数恒定，Load Average 较低，系统状态更健康
 
 select 模型用更少的 CPU、内存和调度成本，支撑了远多于线程数的并发连接，是 I/O 密集型服务器的更优选择。
+
+
+poll模型：
+pollfd结构体：
+struct pollfd {
+    int   fd;        // 要监控的文件描述符
+    short events;    // 希望监控的事件类型（输入）
+    short revents;   // 实际发生的事件类型（输出，由poll填充）
+};
+poll 相比 select，在“可扩展性”上更好，但在“高并发性能”上并不一定更好。
+poll 相比 select，去除了 fd 数量的硬限制，能够同时处理更多客户端连接；但由于每次都需要线性扫描所有 fd，在高并发但低活跃场景下，CPU 资源利用率并不高。
