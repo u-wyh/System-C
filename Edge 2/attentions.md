@@ -106,3 +106,53 @@ struct pollfd {
 };
 poll 相比 select，在“可扩展性”上更好，但在“高并发性能”上并不一定更好。
 poll 相比 select，去除了 fd 数量的硬限制，能够同时处理更多客户端连接；但由于每次都需要线性扫描所有 fd，在高并发但低活跃场景下，CPU 资源利用率并不高。
+
+
+epoll模型：
+
+int epoll_create1(int flags);
+作用：创建一个 epoll 实例，返回一个特殊的文件描述符（epfd），之后所有 epoll 相关操作都基于这个实例。
+
+参数：flags：0：默认；EPOLL_CLOEXEC：当进程调用 exec 系列函数时自动关闭 epfd，防止泄漏到子进程‘
+
+返回值：成功：epoll 实例对应的 fd（整数）  失败：-1，设置 errno
+
+在内核中创建一个 epoll 内部对象。内部保存一个 监听集合（红黑树），记录被监听的 fd；内部有一个 就绪队列，记录已发生事件的 fd
+返回一个 fd（epfd）给用户态，用户态后续用它调用 epoll_ctl 或 epoll_wait
+
+
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
+作用：操作 epoll 实例的监听集合：增加、修改或删除某个 fd 的事件监听
+
+参数	含义
+epfd	epoll_create1 返回的 epoll 实例 fd
+op	    操作类型：EPOLL_CTL_ADD / EPOLL_CTL_MOD / EPOLL_CTL_DEL
+fd	    要操作的文件描述符（socket）
+event	事件描述结构体（epoll_event），包含事件类型 + 用户态标识
+
+内核层面做了什么
+
+根据 op：
+EPOLL_CTL_ADD：把 fd 加入监听集合
+EPOLL_CTL_MOD：修改 fd 的事件
+EPOLL_CTL_DEL：删除 fd
+把 epoll_event 保存到内核
+
+epoll_event:
+events：你关心的事件类型
+data：用户态标识（fd/pointer/id）
+建立 fd → epoll 的映射关系,内核用这个映射查找就绪事件
+
+int nready = epoll_wait(epfd, events.data(), events.size(), -1);
+作用：等待 epoll 实例中的事件发生
+
+返回值 nready：实际发生事件的数量
+
+参数解释：
+epfd → epoll 实例的 fd（epoll_create1 返回的）
+events.data() → 用户态数组首地址，用来接收事件信息
+events.size() → 用户态数组最大容量，告诉内核最多可以写入多少事件
+阻塞时间（毫秒）
+-1：无限阻塞，直到至少有一个事件就绪
+0：非阻塞检查
+>0：等待指定毫秒数
