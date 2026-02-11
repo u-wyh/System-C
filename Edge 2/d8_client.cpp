@@ -32,7 +32,7 @@ void client_worker(const string &server_ip,int server_port,int id){
     cout<<"[client "<<id<<"] connected."<<endl;
 
     while(true){
-        const char *msg="hello world";
+        const char *msg="hello world\n";
         send(sockfd,msg,strlen(msg),0);
         this_thread::sleep_for(chrono::milliseconds(100));
     }
