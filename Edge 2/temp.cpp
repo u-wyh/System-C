@@ -3,31 +3,30 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <chrono>
 #include <queue>
 #include <functional>
 #include <condition_variable>
-#include <chrono>
 #include <sstream>
+#include <fstream>
 #include <iomanip>
+#include <random>
+#include <algorithm>
+#include <csignal>
 
 using namespace std;
-using namespace std::chrono;
 
-// -------------------------
-// 线程安全输出函数
-// -------------------------
+// ----------------- 日志工具 -----------------
 mutex ioMutex;
-void log_line(const string& msg) {
+
+void log_line(const string &msg) {
     lock_guard<mutex> lock(ioMutex);
     cout << msg << endl;
 }
 
-// -------------------------
-// 获取当前时间字符串（Linux 下线程安全）
-// -------------------------
-string now_datetime() {
-    auto now = system_clock::now();
-    time_t t = system_clock::to_time_t(now);
+string now_time() {
+    auto now = chrono::system_clock::now();
+    time_t t = chrono::system_clock::to_time_t(now);
     tm tm_buf{};
     localtime_r(&t, &tm_buf); // Linux 下线程安全
     char buf[32];
@@ -35,68 +34,79 @@ string now_datetime() {
     return string(buf);
 }
 
-// -------------------------
-// 线程池类
-// -------------------------
+// ----------------- 任务结构 -----------------
+enum class TaskType { COMPUTE, IO };
+
+struct Task {
+    TaskType type;
+    string name;
+    function<void()> func;
+
+    Task(TaskType t, const string &n, function<void()> f)
+        : type(t), name(n), func(f) {}
+};
+
+// ----------------- 线程池 -----------------
 class ThreadPool {
 private:
     vector<thread> workers;
-    queue<function<void()>> tasks;
+    queue<Task> tasks;
     mutex queueMutex;
     condition_variable condvar;
     atomic<bool> running;
 
-    // 统计信息
-    vector<int> threadTaskCount;
-    atomic<int> totalExceptionCount;
+    vector<int> threadTask;
+    atomic<int> totalException;
 
 public:
     ThreadPool(size_t threadNum)
-        : running(true), threadTaskCount(threadNum, 0), totalExceptionCount(0)
-    {
-        for (size_t i = 0; i < threadNum; ++i) {
+        : running(true), threadTask(threadNum, 0), totalException(0) {
+        for (size_t i = 0; i < threadNum; i++) {
             workers.emplace_back([this, i]() {
                 while (true) {
-                    function<void()> task;
+                    Task task(TaskType::IO, "", [] {});
                     {
                         unique_lock<mutex> lock(queueMutex);
                         condvar.wait(lock, [this]() { return !tasks.empty() || !running; });
-                        if (!running && tasks.empty()) return;
+                        if (!running && tasks.empty())
+                            return;
                         task = move(tasks.front());
                         tasks.pop();
                     }
 
-                    auto start = high_resolution_clock::now();
+                    auto start = chrono::high_resolution_clock::now();
                     try {
-                        task();
-                    }
-                    catch (const exception& e) {
-                        string msg = "[" + now_datetime() + "][Thread " + to_string(i) + "] exception: " + e.what();
+                        string msg = "[" + now_time() + "][Thread " + to_string(i) +
+                                     "] executing task: " + task.name + " [" +
+                                     (task.type == TaskType::IO ? "IO" : "COMPUTE") + "]";
                         log_line(msg);
-                        totalExceptionCount++;
-                    }
-                    catch (...) {
-                        string msg = "[" + now_datetime() + "][Thread " + to_string(i) + "] unknown exception.";
+                        task.func();
+                    } catch (const exception &e) {
+                        string msg = "[" + now_time() + "][Thread " + to_string(i) +
+                                     "] exception: " + e.what();
                         log_line(msg);
-                        totalExceptionCount++;
+                        totalException++;
+                    } catch (...) {
+                        string msg = "[" + now_time() + "][Thread " + to_string(i) +
+                                     "] unknown exception";
+                        log_line(msg);
+                        totalException++;
                     }
-                    auto end = high_resolution_clock::now();
-                    auto duration = duration_cast<milliseconds>(end - start).count();
-
-                    threadTaskCount[i]++;
-                    string msg = "[Thread " + to_string(i) + "] task completed, duration: " + to_string(duration) + " ms, total tasks executed: " + to_string(threadTaskCount[i]);
-                    log_line(msg);
+                    auto end = chrono::high_resolution_clock::now();
+                    auto duration = chrono::duration_cast<chrono::milliseconds>(end - start).count();
+                    threadTask[i]++;
+                    log_line("[Thread " + to_string(i) + "] task completed, duration: " + to_string(duration) + " ms");
                 }
             });
         }
     }
 
-    ~ThreadPool() {
-        shutdown();
-    }
+    ~ThreadPool() { shutdown(); }
 
-    void submit(function<void()> task) {
-        if (!running) throw runtime_error("ThreadPool is stopped, cannot submit task.");
+    void submit(Task task) {
+        if (!running) {
+            throw runtime_error("ThreadPool is stopped, cannot submit task.");
+        }
         {
             lock_guard<mutex> lock(queueMutex);
             tasks.push(move(task));
@@ -107,78 +117,141 @@ public:
     void shutdown() {
         running = false;
         condvar.notify_all();
-        for (auto& t : workers) if (t.joinable()) t.join();
-
-        log_line("\n=== ThreadPool Shutdown Complete ===");
-        log_line("Total exceptions: " + to_string(totalExceptionCount.load()));
-        for (size_t i = 0; i < threadTaskCount.size(); ++i) {
-            log_line("Thread " + to_string(i) + " executed " + to_string(threadTaskCount[i]) + " tasks");
+        for (auto &t : workers) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        log_line("ThreadPool shutdown.");
+        log_line("Total exceptions: " + to_string(totalException));
+        for (size_t i = 0; i < threadTask.size(); ++i) {
+            log_line("Thread " + to_string(i) + " executed " + to_string(threadTask[i]) + " tasks");
         }
     }
 };
 
-// -------------------------
-// 主函数
-// -------------------------
+// ----------------- Service -----------------
+class Service {
+public:
+    enum class State { INIT, RUNNING, STOPPING, STOPPED };
+
+    Service(size_t threadNum) : state(State::INIT), pool(threadNum) {}
+
+    ~Service() {
+        if (get_state() == State::RUNNING || get_state() == State::STOPPING) {
+            stop();
+        }
+    }
+
+    void start() {
+        lock_guard<mutex> lock(stateMutex);
+        if (state != State::INIT) {
+            log_line("Service cannot start, current state: " + state_to_string(state));
+            return;
+        }
+        state = State::RUNNING;
+        log_line("Service starting...");
+
+        mainThread = thread([this]() {
+            int counter = 0;
+            while (true) {
+                {
+                    lock_guard<mutex> lock(stateMutex);
+                    if (state != State::RUNNING) {
+                        break;
+                    }
+                }
+
+                pool.submit(Task(TaskType::COMPUTE, "Task" + to_string(counter), [counter]() {
+                    log_line("Executing Task " + to_string(counter));
+                    this_thread::sleep_for(chrono::milliseconds(200));
+                }));
+
+                counter++;
+                this_thread::sleep_for(chrono::milliseconds(500));
+            }
+            log_line("Service main thread exiting...");
+            lock_guard<mutex> lock(stateMutex);
+            state = State::STOPPED;
+        });
+    }
+
+    void stop() {
+        {
+            lock_guard<mutex> lock(stateMutex);
+            if (state != State::RUNNING) {
+                log_line("Service not running, cannot stop");
+                return;
+            }
+            log_line("Service stopping...");
+            state = State::STOPPING;
+        }
+
+        if (mainThread.joinable()) {
+            mainThread.join();
+        }
+        pool.shutdown();
+        log_line("Service stopped.");
+    }
+
+    State get_state() {
+        lock_guard<mutex> lock(stateMutex);
+        return state;
+    }
+
+    static string state_to_string(State s) {
+        switch (s) {
+        case State::INIT:
+            return "INIT";
+        case State::RUNNING:
+            return "RUNNING";
+        case State::STOPPING:
+            return "STOPPING";
+        case State::STOPPED:
+            return "STOPPED";
+        default:
+            return "UNKNOWN";
+        }
+    }
+
+private:
+    mutex stateMutex;
+    State state;
+    ThreadPool pool;
+    thread mainThread;
+};
+
+// ----------------- 全局 Service 指针，用于 signal handler -----------------
+Service *g_service = nullptr;
+
+void signal_handler(int sig) {
+    if (g_service) {
+        log_line("Signal received: " + to_string(sig));
+        g_service->stop();
+    }
+}
+
+// ----------------- main -----------------
 int main() {
-    ThreadPool pool(4);
+    Service service(4);
+    g_service = &service;
 
-    // 1️⃣ 普通任务（打印开始和结束）
-    for (int i = 1; i <= 5; ++i) {
-        pool.submit([i]() {
-            ostringstream oss;
-            oss << this_thread::get_id();
-            string tid_str = oss.str();
+    // 注册信号处理
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
 
-            string msg = "Task " + to_string(i) + " started, thread id: " + tid_str;
-            log_line(msg);
+    log_line("Initial state: " + Service::state_to_string(service.get_state()));
 
-            this_thread::sleep_for(chrono::milliseconds(500));
+    service.start();
 
-            msg = "Task " + to_string(i) + " end";
-            log_line(msg);
-        });
+    // 主线程等待服务运行（可替换为更长时间或阻塞等待）
+    this_thread::sleep_for(chrono::seconds(10));
+
+    // 正常停止（如果没有收到信号）
+    if (service.get_state() == Service::State::RUNNING) {
+        service.stop();
     }
 
-    // 2️⃣ 异常任务
-    pool.submit([]() { throw runtime_error("simulated exception"); });
-    pool.submit([]() { throw 123; });
-
-    // 3️⃣ 长任务（模拟耗时 3 秒）
-    pool.submit([]() {
-        ostringstream oss;
-        oss << this_thread::get_id();
-        string tid_str = oss.str();
-
-        string msg = "Long task started, thread id: " + tid_str;
-        log_line(msg);
-
-        this_thread::sleep_for(chrono::seconds(3));
-
-        msg = "Long task end";
-        log_line(msg);
-    });
-
-    // 4️⃣ 后续普通任务（异常后继续提交）
-    for (int i = 6; i <= 8; ++i) {
-        pool.submit([i]() {
-            ostringstream oss;
-            oss << this_thread::get_id();
-            string tid_str = oss.str();
-
-            string msg = "Task " + to_string(i) + " started after exceptions, thread id: " + tid_str;
-            log_line(msg);
-
-            this_thread::sleep_for(chrono::milliseconds(500));
-
-            msg = "Task " + to_string(i) + " end";
-            log_line(msg);
-        });
-    }
-
-    // 等待所有任务完成
-    this_thread::sleep_for(chrono::seconds(8));
-    pool.shutdown();
-
+    log_line("Final state: " + Service::state_to_string(service.get_state()));
     return 0;
 }
