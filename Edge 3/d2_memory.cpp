@@ -97,8 +97,16 @@ private:
     thread t;
 
 public:
-    template<typename Func>
-    ThreadWrapper(Func&& f) : t(forward<Func>(f)) {}
+    template<typename Func,typename... Args>
+    explicit ThreadWrapper(Func&& f,Args&&... args){
+        try{
+            t=thread(forward<Func>(f),forward<Args>(args)...);
+        }
+        catch(const system_error&e){
+            cerr<<"Thread creation failed: "<<e.what()<<endl;
+            throw;
+        }
+    }
 
     ~ThreadWrapper() {
         if (t.joinable())
@@ -115,7 +123,7 @@ class Service {
 private:
     File logFile{"service.log", "w"};
     Socket server{8080};
-    vector<unique_ptr<ThreadWrapper>> workers;
+    vector<ThreadWrapper> workers;
     atomic<bool> running{false};
 
 public:
@@ -149,11 +157,8 @@ public:
     void start() {
         running = true;
 
-        workers.emplace_back(make_unique<ThreadWrapper>(
-            [this]() { log_worker(); }));
-
-        workers.emplace_back(make_unique<ThreadWrapper>(
-            [this]() { tcp_worker(); }));
+        workers.emplace_back(&Service::log_worker,this);
+        workers.emplace_back(&Service::tcp_worker,this);
     }
 
     void stop() {
