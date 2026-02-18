@@ -1,179 +1,201 @@
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include <signal.h>
+
 #include <iostream>
-#include <memory>
-#include <vector>
 #include <thread>
+#include <vector>
 #include <atomic>
 #include <chrono>
-#include <cstring>
-#include <mutex>
-#include <stdexcept>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 using namespace std;
 
-class File {
-private:
-    unique_ptr<FILE, decltype(&fclose)> file;
+constexpr int PORT = 8080;
+constexpr int MAX_EVENTS = 1024;
+constexpr int WORKER_NUM = 4;   // 建议 = CPU 核数
 
+atomic<bool> g_running{true};
+atomic<long long> g_total_requests{0};
+atomic<long long> g_active_connections{0};
+
+void signal_handler(int)
+{
+    g_running = false;
+}
+
+void set_nonblock(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+class Worker
+{
 public:
-    File(const string& name, const string& mode)
-        : file(fopen(name.c_str(), mode.c_str()), fclose) {
-        if (!file)
-            throw runtime_error("Failed to open file: " + name);
+    Worker()
+    {
+        epfd = epoll_create1(0);
     }
 
-    void write(const string& data) {
-        fwrite(data.c_str(), 1, data.size(), file.get());
-        fflush(file.get());
-    }
-};
+    void add_fd(int fd)
+    {
+        epoll_event ev{};
+        ev.events = EPOLLIN | EPOLLET;
+        ev.data.fd = fd;
+        epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
 
-class Socket {
-private:
-    int fd;
-
-public:
-    explicit Socket(int port) {
-        fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0)
-            throw runtime_error("socket failed");
-
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port);
-
-        if (bind(fd, (sockaddr*)&addr, sizeof(addr)) < 0)
-            throw runtime_error("bind failed");
-
-        if (listen(fd, 10) < 0)
-            throw runtime_error("listen failed");
+        g_active_connections++;
     }
 
-    int accept_client() {
-        int client_fd = accept(fd, nullptr, nullptr);
-        if (client_fd < 0)
-            throw runtime_error("accept failed");
-        return client_fd;
-    }
+    void run()
+    {
+        epoll_event events[MAX_EVENTS];
 
-    ~Socket() {
-        if (fd >= 0)
-            close(fd);
-    }
-};
-
-class ClientSocket {
-private:
-    int fd;
-
-public:
-    explicit ClientSocket(int client_fd) : fd(client_fd) {}
-
-    ssize_t recv_data(string& msg) {
-        char buffer[1024];
-        ssize_t n = recv(fd, buffer, sizeof(buffer) - 1, 0);
-        if (n > 0) {
-            buffer[n] = 0;
-            msg = buffer;
+        while (g_running)
+        {
+            int n = epoll_wait(epfd, events, MAX_EVENTS, 1000);
+            for (int i = 0; i < n; i++)
+            {
+                int fd = events[i].data.fd;
+                handle_read(fd);
+            }
         }
-        return n;
+
+        close(epfd);
     }
 
-    void send_data(const string& msg) {
-        send(fd, msg.c_str(), msg.size(), 0);
-    }
+private:
+    int epfd;
 
-    ~ClientSocket() {
-        if (fd >= 0)
-            close(fd);
+    void handle_read(int fd)
+    {
+        char buf[4096];
+
+        while (true)
+        {
+            ssize_t n = recv(fd, buf, sizeof(buf), 0);
+
+            if (n > 0)
+            {
+                g_total_requests++;
+                send(fd, buf, n, 0);
+            }
+            else if (n == 0)
+            {
+                close(fd);
+                g_active_connections--;
+                break;
+            }
+            else
+            {
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    break;
+
+                close(fd);
+                g_active_connections--;
+                break;
+            }
+        }
     }
 };
 
-class ThreadWrapper {
-private:
-    thread t;
+int main()
+{
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
 
-public:
-    template<typename Func>
-    ThreadWrapper(Func&& f) : t(forward<Func>(f)) {}
+    int listenfd = socket(AF_INET, SOCK_STREAM, 0);
 
-    ~ThreadWrapper() {
+    int opt = 1;
+    setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    set_nonblock(listenfd);
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    bind(listenfd, (sockaddr*)&addr, sizeof(addr));
+    listen(listenfd, 1024);
+
+    cout << "[Server] listening on port " << PORT << endl;
+
+    vector<unique_ptr<Worker>> workers;
+    vector<thread> threads;
+
+    for (int i = 0; i < WORKER_NUM; i++)
+    {
+        workers.emplace_back(new Worker());
+    }
+
+    for (int i = 0; i < WORKER_NUM; i++)
+    {
+        threads.emplace_back(&Worker::run, workers[i].get());
+    }
+
+    // 监控线程
+    thread monitor([](){
+        long long last_total = 0;
+        int sec = 0;
+
+        while (g_running)
+        {
+            this_thread::sleep_for(chrono::seconds(1));
+
+            long long now = g_total_requests.load();
+            long long tps = now - last_total;
+
+            cout << "[Monitor] "
+                 << ++sec
+                 << "s total=" << now
+                 << " TPS=" << tps
+                 << " active_conn=" << g_active_connections.load()
+                 << endl;
+
+            last_total = now;
+        }
+    });
+
+    int idx = 0;
+
+    while (g_running)
+    {
+        sockaddr_in client{};
+        socklen_t len = sizeof(client);
+
+        int connfd = accept(listenfd, (sockaddr*)&client, &len);
+
+        if (connfd < 0)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                this_thread::sleep_for(chrono::milliseconds(1));
+                continue;
+            }
+            continue;
+        }
+
+        set_nonblock(connfd);
+
+        workers[idx]->add_fd(connfd);
+        idx = (idx + 1) % WORKER_NUM;
+    }
+
+    cout << "Shutting down..." << endl;
+
+    close(listenfd);
+
+    for (auto &t : threads)
         if (t.joinable())
             t.join();
-    }
 
-    ThreadWrapper(const ThreadWrapper&) = delete;
-    ThreadWrapper& operator=(const ThreadWrapper&) = delete;
+    if (monitor.joinable())
+        monitor.join();
 
-    ThreadWrapper(ThreadWrapper&&) = default;
-};
-
-class Service {
-private:
-    File logFile{"service.log", "w"};
-    Socket server{8080};
-    vector<unique_ptr<ThreadWrapper>> workers;
-    atomic<bool> running{false};
-
-public:
-    void log_worker() {
-        while (running) {
-            logFile.write("log entry\n");
-            this_thread::sleep_for(chrono::seconds(1));
-        }
-    }
-
-    void tcp_worker() {
-        while (running) {
-            try {
-                int fd = server.accept_client();
-
-                // 用 RAII 保证异常安全
-                ClientSocket client(fd);
-
-                string msg;
-                while (client.recv_data(msg) > 0) {
-                    client.send_data(msg);
-                }
-            }
-            catch (...) {
-                if (running)
-                    cerr << "worker error\n";
-            }
-        }
-    }
-
-    void start() {
-        running = true;
-
-        workers.emplace_back(make_unique<ThreadWrapper>(
-            [this]() { log_worker(); }));
-
-        workers.emplace_back(make_unique<ThreadWrapper>(
-            [this]() { tcp_worker(); }));
-    }
-
-    void stop() {
-        running = false;
-        workers.clear();  // 自动 join
-    }
-};
-
-int main() {
-    try {
-        Service service;
-        service.start();
-
-        this_thread::sleep_for(chrono::seconds(10));
-
-        service.stop();
-    }
-    catch (const exception& e) {
-        cerr << "[Fatal] " << e.what() << endl;
-    }
+    cout << "Server exited gracefully." << endl;
 
     return 0;
 }
