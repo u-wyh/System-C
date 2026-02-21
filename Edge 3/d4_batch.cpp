@@ -1,53 +1,50 @@
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <sys/epoll.h>
-#include <fcntl.h>
-#include <signal.h>
-
-#include <iostream>
-#include <vector>
-#include <thread>
-#include <atomic>
-#include <queue>
-#include <mutex>
-#include <condition_variable>
-#include <memory>
-#include <unordered_map>
+#include<arpa/inet.h>
+#include<unistd.h>
+#include<sys/epoll.h>
+#include<fcntl.h>
+#include<signal.h>
+#include<iostream>
+#include<vector>
+#include<thread>
+#include<atomic>
+#include<queue>
+#include<mutex>
+#include<condition_variable>
+#include<memory>
+#include<unordered_map>
 
 using namespace std;
-
-constexpr int PORT = 8080;
-constexpr int MAX_EVENTS = 1024;
-constexpr int BUFFER_SIZE = 4096;
 
 atomic<bool> g_running{true};
 atomic<long long> total_requests{0};
 atomic<int> active_connections{0};
 
-void signal_handler(int) { g_running = false; }
-
-int set_nonblocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+void signal_handler(int){
+    g_running=false;
 }
 
-/* ===================== Client ===================== */
+int set_nonblocking(int fd){
+    int flags=fcntl(fd,F_GETFL,0);
+    if(flags==-1){
+        return -1;
+    }
+    return fcntl(fd,F_SETFL,flags|O_NONBLOCK);
+}
 
-struct Client {
+struct Client{
     int fd;
-    atomic<bool> closed{false};
-
-    Client(int f) : fd(f) {}
-    void close_fd() {
-        bool expected = false;
-        if (closed.compare_exchange_strong(expected, true)) {
+    atomic<bool>closed{false};
+    
+    Client(int f):fd(f){}
+    
+    void close_fd(){
+        bool expected=false;
+        if(closed.compare_exchange_strong(expected,true)){
             ::close(fd);
             active_connections--;
         }
     }
 };
-
-/* ===================== 线程池 ===================== */
 
 class ThreadPool {
 public:
@@ -100,7 +97,7 @@ private:
     bool stop;
 
     static void handle_client(shared_ptr<Client> client) {
-        char buffer[BUFFER_SIZE];
+        char buffer[1024];
         while (true) {
             ssize_t n = recv(client->fd, buffer, sizeof(buffer), 0);
             if (n > 0) {
@@ -119,48 +116,50 @@ private:
     }
 };
 
-/* ===================== 主函数 ===================== */
+int main()
+{
+    signal(SIGINT,signal_handler);
+    signal(SIGTERM,signal_handler);
 
-int main() {
-    signal(SIGINT, signal_handler);
+    int port=8080;
+    int workernum=4;
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
     set_nonblocking(listen_fd);
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT);
+    addr.sin_port = htons(port);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    bind(listen_fd, (sockaddr *)&addr, sizeof(addr));
+    bind(listen_fd, (sockaddr*)&addr, sizeof(addr));
     listen(listen_fd, 1024);
-
-    int epfd = epoll_create1(0);
-
+    int epfd=epoll_create1(0);
     epoll_event ev{};
     ev.events = EPOLLIN | EPOLLET;
     ev.data.fd = listen_fd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev);
 
     ThreadPool pool(thread::hardware_concurrency());
+    vector<epoll_event>events(1024);
 
-    vector<epoll_event> events(MAX_EVENTS);
-
-    thread monitor([] {
-        while (g_running) {
+    thread monitor([]{
+        while(g_running){
             this_thread::sleep_for(chrono::seconds(1));
-            cout << "[Monitor] total=" << total_requests
-                 << " active=" << active_connections
-                 << endl;
+            cout<<"[Monitor] total"<<total_requests<<" active="<<active_connections<<endl;
         }
     });
 
-    cout << "Server listening on port " << PORT << endl;
-
+    cout << "[Server] listening on port " << port << endl;
+    
     unordered_map<int, shared_ptr<Client>> clients;
 
     while (g_running) {
-        int n = epoll_wait(epfd, events.data(), MAX_EVENTS, 1000);
+        int n = epoll_wait(epfd, events.data(), 1024, 1000);
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
 
