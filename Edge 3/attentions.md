@@ -155,3 +155,47 @@ CPU优化：
 缺点：负载不均衡时难调节，不适合阻塞任务，扩展业务复杂度高，需要设计连接分配策略
 
 线程池模型是“任务驱动”，per-thread epoll 是“事件驱动”
+
+
+
+内核系统：
+文件和 Socket 的内核操作
+文件操作：open → read → write → close
+Socket 操作：socket → bind → listen → accept → recv/send → close
+重点是理解这些调用背后内核做了什么（页缓存、文件描述符分配、网络缓冲、阻塞等待等）
+
+| 用户态操作   | 系统调用                      | 内核数据结构                  | 内核行为                        |
+| -------     | ------------------------- | ----------------------- | --------------------------- |
+| 打开文件    | open/openat               | file struct, inode      | 分配 fd，建立内核文件结构              |
+| 写文件     | write/writev              | file struct, page cache | 拷贝数据 → 内核缓冲区 → 标记 dirty     |
+| 读文件     | read/pread                | file struct, page cache | 从 page cache 或磁盘拷贝到用户空间     |
+| 关闭文件    | close                     | file struct             | flush dirty page（必要时），释放 fd |
+| 睡眠/模拟阻塞 | nanosleep/clock_nanosleep | task_struct             | 挂起线程 → CPU 调度其他线程           |
+| 输出到终端   | write(1)                  | tty driver, buffer      | 拷贝到终端缓冲 → 写屏 / 阻塞           |
+
+文件 IO 性能观察
+
+缓冲机制：
+用户态缓冲：如 std::ofstream，写入时先放在程序缓冲区，减少系统调用次数。
+内核态缓冲：page cache，写入磁盘前先存内核缓冲，异步刷新。
+
+实验结论：
+暴力写（每行直接 write()） → 大量系统调用 → CPU 占用高、吞吐量低。
+缓冲写（ofstream 或 writev） → 减少系统调用次数 → 吞吐量高。
+阻塞不会占用 CPU，但会延迟线程完成 → 单线程中效率低，多线程会产生上下文切换开销。
+
+吞吐量：单位时间内完成的操作数量（如 MB/s 或 行数/s）。
+延迟：单次操作从发起到完成的时间。
+
+| 用户态操作        | 系统调用                                 | 内核数据结构                              | 内核行为                                        |
+| ------------ | ------------------------------------ | ----------------------------------- | ------------------------------------------- |
+| 创建套接字        | `socket(AF_INET, SOCK_STREAM)`       | `struct socket`, `struct inet_sock` | 分配 socket，初始化 TCP 控制块，注册内核资源                |
+| 绑定端口         | `bind(sockfd, addr, len)`            | `struct socket`, `inet_sock`        | 检查端口是否可用 → 绑定 socket 和 IP+端口 → 更新内核端口分配表    |
+| 监听端口         | `listen(sockfd, backlog)`            | `struct socket`, `listen_queue`     | 创建半连接队列 + 完全连接队列，等待三次握手                     |
+| 接受客户端连接（阻塞）  | `accept(sockfd)`                     | `struct socket`, `inet_sock`        | 阻塞等待连接到来 → 三次握手完成 → 分配新的 socket fd          |
+| 接受客户端连接（非阻塞） | `accept(sockfd, O_NONBLOCK)`         | `struct socket`, `inet_sock`        | 检查队列是否有连接 → 若无立即返回 `-1/EAGAIN`              |
+| 接收数据（阻塞）     | `recvfrom(fd, buf, len, 0)`          | `socket buffer`, `task_struct`      | 若缓冲区无数据 → 进程挂起 → 数据到达时唤醒 → 拷贝到用户空间          |
+| 接收数据（非阻塞）    | `recvfrom(fd, buf, len, O_NONBLOCK)` | `socket buffer`                     | 检查缓冲区 → 若无数据立即返回 `-1/EAGAIN`                |
+| 发送数据         | `write(fd, buf, len)`                | `socket buffer`, `tcp_skb`          | 拷贝用户数据到内核缓冲区 → TCP 封包发送 → 若缓冲区满阻塞/返回 EAGAIN |
+| 关闭连接         | `close(fd)`                          | `socket buffer`, `struct socket`    | 四次挥手关闭 TCP → 释放 PCB、缓冲区 → 解除端口绑定            |
+| 模拟非阻塞等待（轮询）  | `nanosleep` / `clock_nanosleep`      | `task_struct`                       | 挂起线程 → CPU 调度其他线程，减少轮询 CPU 占用               |

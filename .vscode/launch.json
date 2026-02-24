@@ -2,6 +2,35 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "调试当前文件",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${fileDirname}/output/${fileBasenameNoExtension}${command:pickOsSpecificString,windows:.exe,linux:}",
+      "windows": {
+        "program": "${fileDirname}\\output\\${fileBasenameNoExtension}.exe",
+        "MIMode": "gdb",
+        "miDebuggerPath": "C:\\mingw64\\bin\\gdb.exe"
+      },
+      "linux": {
+        "program": "${fileDirname}/output/${fileBasenameNoExtension}",
+        "MIMode": "gdb",
+        "miDebuggerPath": "/usr/bin/gdb"
+      },
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${fileDirname}",
+      "environment": [],
+      "externalConsole": false,
+      "setupCommands": [
+        {
+          "description": "为 gdb 启用整齐打印",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ],
+      "preLaunchTask": "编译当前文件"
+    },
+    {
       "name": "C/C++ Runner: Debug Session",
       "type": "cppdbg",
       "request": "launch",

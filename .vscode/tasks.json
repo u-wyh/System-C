@@ -1,0 +1,63 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "shell",
+            "label": "编译当前文件",
+            "windows": {
+                "command": "powershell",
+                "args": [
+                    "-Command",
+                    "if (-not (Test-Path '${fileDirname}\\output')) { New-Item -ItemType Directory -Path '${fileDirname}\\output' | Out-Null }; C:\\mingw64\\bin\\g++.exe -Wall -Wextra -g3 '${file}' -o '${fileDirname}\\output\\${fileBasenameNoExtension}.exe'"
+                ]
+            },
+            "linux": {
+                "command": "/bin/bash",
+                "args": [
+                    "-c",
+                    "mkdir -p '${fileDirname}/output' && g++ -Wall -Wextra -g3 '${file}' -o '${fileDirname}/output/${fileBasenameNoExtension}' -pthread"
+                ]
+            },
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "在当前文件目录的output文件夹中生成可执行文件"
+        },
+        {
+            "type": "shell",
+            "label": "编译并运行",
+            "windows": {
+                "command": "powershell",
+                "args": [
+                    "-Command",
+                    "if (-not (Test-Path '${fileDirname}\\output')) { New-Item -ItemType Directory -Path '${fileDirname}\\output' | Out-Null }; C:\\mingw64\\bin\\g++.exe -Wall -Wextra -g3 '${file}' -o '${fileDirname}\\output\\${fileBasenameNoExtension}.exe'; if ($?) { & '${fileDirname}\\output\\${fileBasenameNoExtension}.exe' }"
+                ]
+            },
+            "linux": {
+                "command": "/bin/bash",
+                "args": [
+                    "-c",
+                    "mkdir -p '${fileDirname}/output' && g++ -Wall -Wextra -g3 '${file}' -o '${fileDirname}/output/${fileBasenameNoExtension}' -pthread && '${fileDirname}/output/${fileBasenameNoExtension}'"
+                ]
+            },
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "detail": "编译并运行当前文件，输出到output文件夹"
+        }
+    ]
+}
