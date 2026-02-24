@@ -199,3 +199,24 @@ Socket 操作：socket → bind → listen → accept → recv/send → close
 | 发送数据         | `write(fd, buf, len)`                | `socket buffer`, `tcp_skb`          | 拷贝用户数据到内核缓冲区 → TCP 封包发送 → 若缓冲区满阻塞/返回 EAGAIN |
 | 关闭连接         | `close(fd)`                          | `socket buffer`, `struct socket`    | 四次挥手关闭 TCP → 释放 PCB、缓冲区 → 解除端口绑定            |
 | 模拟非阻塞等待（轮询）  | `nanosleep` / `clock_nanosleep`      | `task_struct`                       | 挂起线程 → CPU 调度其他线程，减少轮询 CPU 占用               |
+
+
+线程迁移（Thread Migration）：
+内核调度器将线程从一个 CPU 核心迁移到另一个核心
+目的：负载均衡，充分利用多核 CPU
+代价：缓存失效（L1/L2）、TLB 失效 → 性能下降
+
+CPU 亲和性（Thread Affinity / CPU Binding）：
+固定线程在指定核心上执行
+优势：减少线程迁移，提高 L1/L2 缓存命中率，延迟更稳定
+劣势：线程数大于核心数时，可能增加上下文切换 → TPS 下降
+
+上下文切换（Context Switch）：
+CPU 切换执行线程时保存/恢复寄存器状态和栈信息
+开销包括：寄存器保存、TLB / cache 失效、调度器计算
+线程过多 → 上下文切换次数增多 → TPS 下降
+
+Linux 调度器（CFS）特性：
+调度器可动态迁移线程到负载较低的核心
+小线程数时，CFS 已经能做到较合理的负载均衡
+大线程数 + 核心少 → 线程绑定有利于延迟稳定
