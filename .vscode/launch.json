@@ -8,10 +8,8 @@
       "args": [],
       "stopAtEntry": false,
       "externalConsole": true,
-      // cwd 改成源文件所在目录
-      "cwd": "${fileDirname}",
-      // 可执行文件改成源文件目录下的 output 文件夹
-      "program": "${fileDirname}/output/outDebug",
+      "cwd": ".",
+      "program": "build/Debug/outDebug",
       "MIMode": "gdb",
       "miDebuggerPath": "gdb",
       "setupCommands": [
