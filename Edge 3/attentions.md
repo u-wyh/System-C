@@ -234,3 +234,8 @@ UDP	  7         5         2
 TCP	  5         4         1        
 INET	  12        9         3        
 FRAG	  0         0         0 
+
+
+
+false sharing实验：
+False Sharing 是指多个线程修改不同变量，但这些变量位于同一个 cache line 中，导致缓存一致性协议频繁失效，从而造成性能下降的现象。
