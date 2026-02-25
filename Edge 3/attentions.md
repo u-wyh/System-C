@@ -220,3 +220,17 @@ Linux 调度器（CFS）特性：
 调度器可动态迁移线程到负载较低的核心
 小线程数时，CFS 已经能做到较合理的负载均衡
 大线程数 + 核心少 → 线程绑定有利于延迟稳定
+
+
+
+内核网络栈：
+(base) wyh@wyh-VirtualBox:~$ ss -s
+Total: 847
+TCP:   5 (estab 0, closed 0, orphaned 0, timewait 0)
+
+Transport Total     IP        IPv6
+RAW	  0         0         0        
+UDP	  7         5         2        
+TCP	  5         4         1        
+INET	  12        9         3        
+FRAG	  0         0         0 

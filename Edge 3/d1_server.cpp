@@ -293,7 +293,7 @@ int main()
     signal(SIGINT,signal_handler);
     signal(SIGTERM,signal_handler);
 
-    ThreadPool pool(8);
+    ThreadPool pool(1);
     EpollServer server(8080,pool);
     server.run();
     return 0;

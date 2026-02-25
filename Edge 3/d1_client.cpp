@@ -51,8 +51,8 @@ int main(){
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    int threads = 500;
-    int message_count = 1000;
+    int threads = 2000;
+    int message_count = 1000000;
     int time = 2;
 
     vector<thread> workers;
