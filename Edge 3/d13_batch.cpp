@@ -1,37 +1,37 @@
 #include <iostream>
 #include <vector>
 #include <thread>
+#include <mutex>
 #include <atomic>
 #include <chrono>
+#include <queue>
 #include <functional>
+#include <condition_variable>
+#include <sstream>
 #include <fstream>
 #include <csignal>
-#include <sstream>
-#include <mutex>
-#include <unordered_map>
-#include <fcntl.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <cstring>
-#include <condition_variable>
-#include <queue>
+#include <unordered_map>
 
 using namespace std;
 
-// ==================== 配置 =====================
+// ---------------- Config ----------------
 struct Config {
     int thread_num = 4;
     int server_port = 8080;
     string log_file = "server.log";
-    int monitor_interval_ms = 1000;
-    int log_batch_size = 256;
-    int log_flush_ms = 50;
+    int monitor_interval = 1000; // ms
+    int log_batch = 256;
+    int log_flush = 50;
 };
 
-// ==================== 工业级异步日志 =====================
+// ---------------- Log ----------------
 enum class LogLevel { DEBUG = 0, INFO = 1, WARN = 2, ERROR = 3 };
 
 class AsyncLogger {
@@ -44,9 +44,10 @@ private:
     thread worker;
     ofstream fout;
     LogLevel level;
-    size_t batch_size;
-    int flush_ms;
+    size_t batch;
+    int flush;
 
+public:
     string now_time() {
         auto now = chrono::system_clock::now();
         time_t t = chrono::system_clock::to_time_t(now);
@@ -60,11 +61,12 @@ private:
     void process() {
         vector<string>* current;
         vector<string>* back;
+
         while (running || !buffer1.empty() || !buffer2.empty()) {
             {
                 unique_lock<mutex> lock(mtx);
-                cv.wait_for(lock, chrono::milliseconds(flush_ms), [this]() {
-                    return !buffer1.empty() || !running;
+                cv.wait_for(lock, chrono::milliseconds(flush), [this]() {
+                    return !buffer1.empty() || !buffer2.empty() || !running;
                 });
                 swap_flag = !swap_flag;
                 if (swap_flag) { current = &buffer1; back = &buffer2; }
@@ -79,18 +81,15 @@ private:
         }
     }
 
-public:
-    AsyncLogger(const string &filename, LogLevel lvl = LogLevel::INFO, size_t batch = 256, int flush_interval_ms = 50)
-        : batch_size(batch), flush_ms(flush_interval_ms), level(lvl) {
+    AsyncLogger(const string &filename, LogLevel lvl = LogLevel::INFO, size_t batch_size = 256, int flush_ms = 50)
+        : batch(batch_size), flush(flush_ms), level(lvl) {
         fout.open(filename, ios::app);
         buffer1.reserve(batch * 2);
         buffer2.reserve(batch * 2);
         worker = thread(&AsyncLogger::process, this);
     }
 
-    ~AsyncLogger() {
-        shutdown();
-    }
+    ~AsyncLogger() { shutdown(); }
 
     void shutdown() {
         running = false;
@@ -120,30 +119,38 @@ public:
 
 AsyncLogger g_logger("server.log", LogLevel::INFO);
 
-// ==================== 线程池 =====================
+// ---------------- ThreadPool (Batch) ----------------
 class ThreadPool {
 private:
     vector<thread> workers;
     queue<function<void()>> tasks;
     mutex queueMutex;
     condition_variable condvar;
-    atomic<bool> running{true};
+    atomic<bool> running;
+    size_t batch_size;
 
 public:
-    ThreadPool(size_t threadNum) {
-        for (size_t i = 0; i < threadNum; i++) {
-            workers.emplace_back([this]() {
+    ThreadPool(size_t threadNum, size_t batch = 64) : running(true), batch_size(batch) {
+        for (size_t i = 0; i < threadNum; ++i) {
+            workers.emplace_back([this] {
                 while (true) {
-                    function<void()> task;
+                    vector<function<void()>> batchTasks;
                     {
                         unique_lock<mutex> lock(queueMutex);
-                        condvar.wait(lock, [this]() { return !tasks.empty() || !running; });
+                        condvar.wait(lock, [this] { return !tasks.empty() || !running; });
                         if (!running && tasks.empty()) return;
-                        task = move(tasks.front());
-                        tasks.pop();
+
+                        while (!tasks.empty() && batchTasks.size() < batch_size) {
+                            batchTasks.push_back(move(tasks.front()));
+                            tasks.pop();
+                        }
                     }
-                    try { task(); }
-                    catch (...) { g_logger.log(LogLevel::ERROR, "[Worker] unknown exception"); }
+
+                    for (auto &task : batchTasks) {
+                        try { task(); }
+                        catch (const exception &e) { g_logger.log(LogLevel::ERROR, "[Worker] exception: " + string(e.what())); }
+                        catch (...) { g_logger.log(LogLevel::ERROR, "[Worker] unknown exception"); }
+                    }
                 }
             });
         }
@@ -152,6 +159,7 @@ public:
     ~ThreadPool() { shutdown(); }
 
     void submit(function<void()> task) {
+        if (!running) throw runtime_error("ThreadPool stopped");
         {
             lock_guard<mutex> lock(queueMutex);
             tasks.push(move(task));
@@ -166,32 +174,38 @@ public:
     }
 };
 
-// ==================== EpollServer =====================
+// ---------------- Utils ----------------
 int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1) return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+// ---------------- EpollServer ----------------
 class EpollServer {
 private:
-    int listen_fd, epfd;
+    int listen_fd;
+    int epfd;
     ThreadPool &pool;
     atomic<bool> running{true};
     unordered_map<int, string> buffers;
-    atomic<uint64_t> tps_counter{0};
+    atomic<int> tps{0};
+    size_t batch_collect_size = 64;
 
 public:
     EpollServer(int port, ThreadPool &tp) : pool(tp) {
         listen_fd = socket(AF_INET, SOCK_STREAM, 0);
         int opt = 1;
         setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = INADDR_ANY;
         addr.sin_port = htons(port);
-        bind(listen_fd, (sockaddr *)&addr, sizeof(addr));
+
+        bind(listen_fd, (sockaddr*)&addr, sizeof(addr));
         listen(listen_fd, 512);
+
         set_nonblocking(listen_fd);
 
         epfd = epoll_create1(0);
@@ -223,9 +237,10 @@ public:
         while (true) {
             sockaddr_in client{};
             socklen_t len = sizeof(client);
-            int cfd = accept(listen_fd, (sockaddr *)&client, &len);
+            int cfd = accept(listen_fd, (sockaddr*)&client, &len);
             if (cfd < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                if (errno == EAGAIN) break;
+                perror("accept fail");
                 continue;
             }
             set_nonblocking(cfd);
@@ -243,46 +258,68 @@ public:
     }
 
     void handle_client(int fd) {
-        char buf[1024];
+        char buffer[1024];
         while (true) {
-            ssize_t n = read(fd, buf, sizeof(buf));
+            ssize_t n = read(fd, buffer, sizeof(buffer));
             if (n > 0) {
-                buffers[fd].append(buf, n);
+                buffers[fd].append(buffer, n);
                 process_buffer(fd);
-            } else if (n == 0) { close_client(fd); break; }
-            else { if (errno == EAGAIN || errno == EWOULDBLOCK) break; else { close_client(fd); break; } }
+            } else if (n == 0) {
+                close_client(fd);
+                break;
+            } else {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                perror("read error");
+                close_client(fd);
+                break;
+            }
         }
     }
 
     void process_buffer(int fd) {
         auto &buffer = buffers[fd];
+        vector<string> batch_msgs;
+
         size_t pos;
         while ((pos = buffer.find('\n')) != string::npos) {
             string msg = buffer.substr(0, pos);
             buffer.erase(0, pos + 1);
-            tps_counter++;
-            pool.submit([fd, msg]() {
-                g_logger.log(LogLevel::DEBUG, "[Worker] fd=" + to_string(fd) + " msg=" + msg);
-            });
-            string echo = msg + "\n";
-            write(fd, echo.c_str(), echo.size());
+            tps++;
+            batch_msgs.push_back(msg);
+            if (batch_msgs.size() >= batch_collect_size) {
+                submit_batch(fd, batch_msgs);
+                batch_msgs.clear();
+            }
         }
+        if (!batch_msgs.empty()) submit_batch(fd, batch_msgs);
     }
 
-    uint64_t get_tps() {
-        uint64_t t = tps_counter.load();
-        tps_counter = 0;
+    void submit_batch(int fd, const vector<string>& msgs) {
+        pool.submit([fd, msgs]() {
+            stringstream ss;
+            ss << this_thread::get_id();
+            for (auto &msg : msgs) {
+                g_logger.log(LogLevel::DEBUG, "[Worker] thread=" + ss.str() + " fd=" + to_string(fd) + " msg=" + msg);
+                string echo = msg + "\n";
+                write(fd, echo.c_str(), echo.size());
+            }
+        });
+    }
+
+    int get_tps() {
+        int t = tps.load();
+        tps = 0;
         return t;
     }
 };
 
-// ==================== 监控 =====================
-void monitor_thread(EpollServer &server, atomic<bool>& running, int interval_ms) {
+// ---------------- Monitor ----------------
+void monitor(EpollServer &server, atomic<bool>& running, int interval) {
     uint64_t lastTotalTime = 0;
     auto lastCheck = chrono::steady_clock::now();
 
     while (running) {
-        this_thread::sleep_for(chrono::milliseconds(interval_ms));
+        this_thread::sleep_for(chrono::milliseconds(interval));
 
         // CPU
         ifstream fstat("/proc/self/stat");
@@ -318,37 +355,32 @@ void monitor_thread(EpollServer &server, atomic<bool>& running, int interval_ms)
     }
 }
 
-// ==================== 优雅退出 =====================
-atomic<bool> g_terminate_flag{false};
-void signal_handler(int sig) { g_terminate_flag = true; }
+// ---------------- Main ----------------
+atomic<bool> g_running{false};
+void signal_handler(int) { g_running = true; }
 
-// ==================== Main =====================
 int main() {
     Config cfg;
-
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    ThreadPool pool(cfg.thread_num);
+    ThreadPool pool(cfg.thread_num, 64); // batch size
     EpollServer server(cfg.server_port, pool);
 
     atomic<bool> monitor_running{true};
     thread server_thread([&]() { server.run(); });
-    thread mon_thread(monitor_thread, ref(server), ref(monitor_running), cfg.monitor_interval_ms);
+    thread mon_thread(monitor, ref(server), ref(monitor_running), cfg.monitor_interval);
 
-    while (!g_terminate_flag) this_thread::sleep_for(chrono::milliseconds(100));
+    while (!g_running) this_thread::sleep_for(chrono::milliseconds(100));
 
     g_logger.log(LogLevel::INFO, "Shutting down...");
 
-    // 停止服务和线程池
     server.stop();
     pool.shutdown();
 
-    // 停止监控线程
     monitor_running = false;
     if (mon_thread.joinable()) mon_thread.join();
 
-    // 异步日志 flush 并退出
     g_logger.shutdown();
 
     if (server_thread.joinable()) server_thread.join();
