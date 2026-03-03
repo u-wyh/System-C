@@ -372,3 +372,94 @@ d13_log_image → 要运行的镜像
 运行效果
 容器启动后，服务程序在容器内部运行
 你在宿主机访问 localhost:8080 就相当于访问容器内部服务
+
+使用docker images可以查看有了几个images  以及各个image的大致情况
+使用docker rmi +“image id” 可以删除指定编号的镜像
+
+
+作用：选择一个已有的 Ubuntu 镜像作为基础
+FROM 表示继承这个镜像，所有基础的 Linux 系统工具都会有
+FROM docker.xuanyuan.run/library/ubuntu:latest
+
+把你本地的 d13_log.cpp 文件拷贝到容器内部的 /app/ 目录
+COPY d13_log.cpp /app/
+设置 当前工作目录，后续的命令（比如编译、运行）都会在 /app 下执行
+WORKDIR /app
+
+RUN 表示在镜像构建时执行命令
+这里更新了 apt 软件源，并安装了 g++ 和 make，保证容器中有 C++ 编译环境
+-y 表示自动确认安装
+RUN apt update && apt install -y g++ make
+
+编译你的 C++ 源代码 d13_log.cpp
+输出可执行文件 d13_log
+编译过程在构建镜像时完成，所以容器启动时已经有编译好的程序
+RUN g++ d13_log.cpp -o d13_log
+
+CMD 指定容器启动后默认执行的命令
+当你运行容器时，会自动执行 ./d13_log
+注意：CMD 只会在容器启动时运行，不会在构建镜像时运行
+CMD ["./d13_log"]
+
+
+
+弹性扩容：
+Nginx：
+Nginx 是一个：🔥 高性能 Web 服务器 + 反向代理服务器 + 负载均衡器
+最早它是为了解决：C10K 问题（同时处理 1 万个并发连接）
+传统服务器模型是：一个连接 → 一个线程。线程多了就崩。
+Nginx 的创新是：事件驱动 + 非阻塞 IO。这和你现在写的 epoll 服务器本质思想一样。
+
+Nginx 有 4 大核心能力：
+1️⃣ Web 服务器 很多网站的静态资源就是 Nginx 直接提供的。
+2️⃣ 反向代理 客户端根本不知道后面有多少机器。
+3️⃣ 负载均衡
+4️⃣ 限流与安全控制：限制 QPS、限制 IP 访问频率、做黑名单、SSL 终止（HTTPS解密）
+
+HAProxy：
+HAProxy 是一个：🔥 高性能 TCP/HTTP 负载均衡器 + 反向代理软件
+特点：
+专注 负载均衡和高可用、
+用 C 语言实现，极度轻量、高性能、
+广泛用于金融、电商、大型网站等对性能和稳定性要求极高的场景
+
+HAProxy可以干什么：
+1️⃣ 负载均衡：支持多种策略（轮询 最少连接 源IP 基于权重）
+2️⃣ 反向代理
+3️⃣ 高可用
+4️⃣ 安全控制
+
+| 特性    | Nginx            | HAProxy               |
+| ----- | ---------------- | --------------------- |
+| 核心用途  | Web 服务器 + 反向代理   | 负载均衡 + 反向代理           |
+| 层级    | HTTP/HTTPS 层（七层） | TCP 层（四层）+ HTTP 层（七层） |
+| 静态资源  | 可以直接提供           | 不提供，专注转发              |
+| 高并发   | 高性能事件驱动          | 极致性能、低延迟              |
+| 配置复杂度 | 易读，丰富功能          | 简洁、专注负载均衡和健康检查        |
+| 模块扩展  | 丰富模块             | 少量扩展，稳定优先             |
+
+简单来说：
+Nginx = 工业级 Web 服务器 + 通用反向代理
+HAProxy = 极致性能的负载均衡器（TCP/HTTP）
+
+用 Dockerfile 构建 epoll_server 镜像，启动三个容器：
+docker run -d --name server1 -p 8081:8080 epoll_server:latest
+docker run -d --name server2 -p 8082:8080 epoll_server:latest
+docker run -d --name server3 -p 8083:8080 epoll_server:latest
+
+使用 Nginx 配置轮询：
+upstream backend {
+    server 127.0.0.1:8081;
+    server 127.0.0.1:8082;
+    server 127.0.0.1:8083;
+}
+
+server {
+    listen 8000;
+    location / {
+        proxy_pass http://backend;
+    }
+}
+
+启动 Nginx 容器，挂载配置文件：
+docker run -d --name nginx_lb -p 8000:8000 -v /path/load_balancer.conf:/etc/nginx/conf.d/load_balancer.conf:ro docker.xuanyuan.run/library/nginx:latest
