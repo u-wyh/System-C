@@ -463,3 +463,33 @@ server {
 
 启动 Nginx 容器，挂载配置文件：
 docker run -d --name nginx_lb -p 8000:8000 -v /path/load_balancer.conf:/etc/nginx/conf.d/load_balancer.conf:ro docker.xuanyuan.run/library/nginx:latest
+
+
+弹性扩容（Elastic Scaling / Horizontal Scaling）核心概念：
+什么是弹性扩容
+服务可以 动态增加或减少后端服务器实例，以应对不同的负载压力
+“弹性”强调 按需伸缩：负载高时增加服务器，低时减少服务器
+目标是 保证服务性能、响应时间和稳定性
+
+横向扩展 vs 纵向扩展
+横向扩展（Horizontal Scaling）：增加服务器节点（你这次实验的方式）
+优点：TPS 总量累加，单机压力不大
+缺点：需要负载均衡和分布式管理
+纵向扩展（Vertical Scaling）：增加单台服务器性能（CPU/内存）
+优点：部署简单
+缺点：性能有限，成本高
+
+实验中的体现
+你启动了 server1 / server2 / server3 三台容器，Nginx 做负载均衡，客户端压力增大 → 三台服务器共同分担请求，TPS 总量提升 → 就体现了横向弹性扩容的效果
+
+实际意义
+当用户访问量突然增加时，你可以 快速增加服务器实例
+流量均匀分发 → 保证响应时间稳定
+成本和资源利用更灵活
+
+💡 总结一句话：弹性扩容就是通过增加后台服务器实例，实现更高吞吐量、更稳定服务，Nginx/HAProxy 等负载均衡就是弹性扩容的关键手段之一。
+
+
+
+配置与热更新：
+热更新 = 在服务运行过程中，不停止进程、不重启服务，直接修改其行为或配置。
