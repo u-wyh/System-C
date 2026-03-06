@@ -482,6 +482,7 @@ int main(){
     }
 
     g_logger.log(LogLevel::INFO, "Shutting down...");
+    cout<<flush;
 
     // 停止服务和线程池
     server.stop();

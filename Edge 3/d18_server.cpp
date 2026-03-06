@@ -498,6 +498,7 @@ int run_server(){
     }
 
     g_logger.log(LogLevel::INFO, "Shutting down...");
+    cout<<flush;
 
     // 停止服务器
     server.stop();
