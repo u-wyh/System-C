@@ -493,6 +493,7 @@ docker run -d --name nginx_lb -p 8000:8000 -v /path/load_balancer.conf:/etc/ngin
 
 配置与热更新：
 热更新 = 在服务运行过程中，不停止进程、不重启服务，直接修改其行为或配置。
+
 docker build -t epoll_server:latest .
 
 docker run -d \

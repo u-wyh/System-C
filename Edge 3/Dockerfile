@@ -8,10 +8,10 @@ RUN apt update && apt install -y g++ make nlohmann-json3-dev
 WORKDIR /app
 
 # 拷贝源代码
-COPY d17_config.cpp /app/
+COPY d19_server.cpp /app/
 
 # 编译程序
-RUN g++ d17_config.cpp -o server -std=c++17 -pthread -O2
+RUN g++ d19_server.cpp -o server -std=c++17 -pthread -O2
 
 # 暴露端口
 EXPOSE 8080
