@@ -19,7 +19,7 @@
 #include <cstring>
 #include <unordered_map>
 #include <sys/stat.h>
-#include <nlohmann/json.hpp> 
+#include <nlohmann/json.hpp>
 #include <sys/wait.h>
 #include <sys/types.h>
 
@@ -33,6 +33,14 @@ struct Config{
     int monitor_interval=1000; // ms
     int log_batch=256;
     int log_flush=50; // ms
+
+    // 新增报警阈值
+    double cpu_warn=80.0;      // % CPU 超过此值报警
+    double cpu_error=120.0;     // % CPU 超过此值严重报警
+    double mem_warn=100.0;     // MB 内存超出报警
+    double mem_error=200.0;    // MB 内存严重报警
+    int tps_warn=10000;          // TPS 超过警告
+    int tps_error=20000;         // TPS 严重警告
 };
 
 enum class LogLevel{
@@ -102,9 +110,7 @@ public:
         worker = thread(&AsyncLogger::process, this);
     }
 
-    ~AsyncLogger(){
-        shutdown();
-    }
+    ~AsyncLogger(){ shutdown(); }
 
     void shutdown(){
         running = false;
@@ -140,23 +146,21 @@ public:
 AsyncLogger g_logger("server.log", LogLevel::INFO);
 
 class ThreadPool {
-    
 private:
-    vector<thread> workers;              // 工作线程列表
-    queue<function<void()>> tasks;       // 任务队列
+    vector<thread> workers;
+    queue<function<void()>> tasks;
     mutex queueMutex;
     condition_variable condvar;
-    atomic<bool> running{true};          // 总开关
-    atomic<size_t> target_thread_num;    // 配置的目标线程数
+    atomic<bool> running{true};
+    atomic<size_t> target_thread_num;
 
 public:
     ThreadPool(size_t threadNum) : target_thread_num(threadNum) {
         resize(threadNum);
     }
 
-    ~ThreadPool() { shutdown(); }
+    ~ThreadPool(){ shutdown(); }
 
-    // 提交任务
     void submit(function<void()> task){
         {
             lock_guard<mutex> lock(queueMutex);
@@ -165,13 +169,9 @@ public:
         condvar.notify_one();
     }
 
-    // 动态调整线程数
     void resize(size_t newSize){
         target_thread_num = newSize;
-
         lock_guard<mutex> lock(queueMutex);
-
-        // 增加线程
         if(newSize > workers.size()){
             for(size_t i = workers.size(); i < newSize; ++i){
                 workers.emplace_back([this](){ worker_loop(); });
@@ -180,7 +180,6 @@ public:
         }
     }
 
-    // 停止线程池
     void shutdown(){
         running = false;
         condvar.notify_all();
@@ -191,29 +190,20 @@ public:
     void worker_loop(){
         while(true){
             function<void()> task;
-
             {
                 unique_lock<mutex> lock(queueMutex);
-                // 等待任务或线程池关闭
                 condvar.wait(lock, [this](){
                     return !tasks.empty() || !running;
                 });
-
-                // 线程池关闭并且任务队列为空 → 退出
                 if(!running && tasks.empty()) return;
-
-                // 线程数量超过目标值 → 空闲线程退出
                 if(workers.size() > target_thread_num) return;
-
                 if(!tasks.empty()){
                     task = move(tasks.front());
                     tasks.pop();
                 }
             }
-
-            // 执行任务
             if(task){
-                try {
+                try{
                     task();
                 } catch(const exception& e){
                     g_logger.log(LogLevel::ERROR, "[Worker] "+string(e.what()));
@@ -269,6 +259,16 @@ public:
         vector<epoll_event> events(1024);
         while(running){
             int n = epoll_wait(epfd, events.data(), events.size(), 500);
+            if(n < 0){
+                if(errno == EINTR){
+                    // epoll_wait 被信号打断，检查 g_running
+                    if(!running) break;
+                    else continue;
+                } else {
+                    perror("epoll_wait");
+                    break;
+                }
+            }
             for(int i=0;i<n;i++){
                 int fd = events[i].data.fd;
                 if(fd == listen_fd) accept_client();
@@ -279,7 +279,16 @@ public:
         g_logger.log(LogLevel::INFO, "[Server] stopped.");
     }
 
-    void stop(){ running=false; }
+    void stop(){
+        running = false;
+        // 关闭所有客户端连接
+        for(auto &kv : buffers){
+            close(kv.first);
+        }
+        buffers.clear();
+        // 关闭 epoll fd
+        close(epfd);
+    }
 
     void accept_client(){
         while(true){
@@ -353,12 +362,13 @@ public:
     int64_t get_total_tps(){ return total_tps.load(); }
 };
 
-void monitor(EpollServer &server, atomic<bool>& running, int interval){
+// ---- 新增监控报警 ----
+void monitor(EpollServer &server, atomic<bool>& running, Config &cfg){
     uint64_t lastTotalTime = 0;
     auto lastCheck = chrono::steady_clock::now();
 
     while(running){
-        this_thread::sleep_for(chrono::milliseconds(interval));
+        this_thread::sleep_for(chrono::milliseconds(cfg.monitor_interval));
 
         // CPU
         ifstream fstat("/proc/self/stat");
@@ -389,8 +399,20 @@ void monitor(EpollServer &server, atomic<bool>& running, int interval){
         // TPS
         uint64_t tps = server.get_tps();
 
-        g_logger.log(LogLevel::INFO, "[Monitor] CPU=" + to_string(cpuUsage) +
-                                      "% Mem=" + to_string(memKB/1024.0) + "MB TPS=" + to_string(tps));
+        stringstream ss;
+        ss << "[Monitor] CPU=" << cpuUsage << "% Mem=" << memKB/1024.0 << "MB TPS=" << tps;
+        g_logger.log(LogLevel::INFO, ss.str());
+
+        // 报警逻辑
+        if(cpuUsage >= cfg.cpu_error) g_logger.log(LogLevel::ERROR, "[ALARM] CPU usage too high: " + to_string(cpuUsage)+"%");
+        else if(cpuUsage >= cfg.cpu_warn) g_logger.log(LogLevel::WARN, "[ALARM] CPU usage warning: " + to_string(cpuUsage)+"%");
+
+        double memMB = memKB/1024.0;
+        if(memMB >= cfg.mem_error) g_logger.log(LogLevel::ERROR, "[ALARM] Memory usage too high: " + to_string(memMB)+"MB");
+        else if(memMB >= cfg.mem_warn) g_logger.log(LogLevel::WARN, "[ALARM] Memory usage warning: " + to_string(memMB)+"MB");
+
+        if(tps >= cfg.tps_error) g_logger.log(LogLevel::ERROR, "[ALARM] TPS too high: " + to_string(tps));
+        else if(tps >= cfg.tps_warn) g_logger.log(LogLevel::WARN, "[ALARM] TPS warning: " + to_string(tps));
     }
 }
 
@@ -434,7 +456,6 @@ public:
             return;
         }
 
-        // 更新线程池
         if(j.contains("thread_num")){
             int newThreads = j["thread_num"];
             if(newThreads != cfg->thread_num){
@@ -445,7 +466,6 @@ public:
             }
         }
 
-        // 更新日志等级
         if(j.contains("log_level")){
             string lvl = j["log_level"];
             LogLevel newLvl = LogLevel::INFO;
@@ -460,115 +480,79 @@ public:
 };
 
 atomic<bool> g_running{false};
-void signal_handler(int){
-    g_running = true;
+void signal_handler(int){ 
+    g_running = true; 
 }
 
 int run_server(){
-
-    Config cfg;
-
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+
+    Config cfg;
 
     ThreadPool pool(cfg.thread_num);
     EpollServer server(cfg.server_port, pool);
 
-    atomic<bool> monitor_running{true};
-
-    thread server_thread([&](){
-        server.run();
+    thread server_thread([&](){ 
+        server.run(); 
     });
 
-    thread mon_thread(
-        monitor,
-        ref(server),
-        ref(monitor_running),
-        cfg.monitor_interval
-    );
+    atomic<bool> monitor_running{true};
+    thread mon_thread(monitor, ref(server), ref(monitor_running), ref(cfg));
 
     ConfigManager cfgMgr("config.json", &cfg, &g_logger, &pool);
-
-    thread cfg_thread([&](){
-        cfgMgr.watch_loop();
+    thread cfg_thread([&](){ 
+        cfgMgr.watch_loop(); 
     });
 
-    while(!g_running){
+    while(!g_running) {
         this_thread::sleep_for(chrono::milliseconds(100));
     }
 
     g_logger.log(LogLevel::INFO, "Shutting down...");
 
-    // 停止服务器
-    server.stop();
-
-    // 关闭线程池
     pool.shutdown();
-
-    // 关闭监控线程
+    server.stop();
     monitor_running = false;
-    if(mon_thread.joinable())
+    if(mon_thread.joinable()) {
         mon_thread.join();
-
-    // 关闭配置监听
+    }
     cfgMgr.stop();
-    if(cfg_thread.joinable())
+    if(cfg_thread.joinable()) {
         cfg_thread.join();
-
-    // 停止日志
+    }
     g_logger.shutdown();
-
-    if(server_thread.joinable())
+    if(server_thread.joinable()) {
         server_thread.join();
+    }
 
-    cout << "[Server] Total requests processed: "
-         << server.get_total_tps() << endl;
-
-    g_logger.log(
-        LogLevel::INFO,
-        "[Server] Total requests processed: "
-        + to_string(server.get_total_tps())
-    );
-
+    cout << "[Server] Total requests processed: " << server.get_total_tps() << endl;
+    g_logger.log(LogLevel::INFO, "[Server] Total requests processed: " + to_string(server.get_total_tps()));
     g_logger.log(LogLevel::INFO, "Server exited gracefully.");
 
     return 0;
 }
 
 int main(){
-
     while(true){
-
         pid_t pid = fork();
-
         if(pid < 0){
             perror("fork failed");
             return 1;
         }
-
-        // 子进程
         if(pid == 0){
-
             cout << "[Watchdog] starting server..." << endl;
-
             int code = run_server();
-
             exit(code);
         }
 
-        // 父进程
         int status;
         cout<<pid<<endl;
         waitpid(pid, &status, 0);
 
         if(WIFEXITED(status)){
-
             int code = WEXITSTATUS(status);
-
-            cout << "[Watchdog] server exited with code "
-                 << code << endl;
-
-            // 正常退出就不重启
+            cout << "[Watchdog] server exited with code " << code << endl;
             if(code == 0){
                 cout << "[Watchdog] normal shutdown" << endl;
                 break;
@@ -576,17 +560,11 @@ int main(){
         }
 
         if(WIFSIGNALED(status)){
-
-            cout << "[Watchdog] server crashed by signal "
-                 << WTERMSIG(status)
-                 << endl;
+            cout << "[Watchdog] server crashed by signal " << WTERMSIG(status) << endl;
         }
 
-        cout << "[Watchdog] restarting server in 2 seconds..."
-             << endl;
-
+        cout << "[Watchdog] restarting server in 2 seconds..." << endl;
         sleep(2);
     }
-
     return 0;
 }
