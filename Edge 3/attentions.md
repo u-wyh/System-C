@@ -502,3 +502,35 @@ docker run -d \
   -v "/media/sf_System-C/Edge 3/config.json:/app/config.json" \
   -v "/media/sf_System-C/Edge 3/server.log:/app/server.log" \
   epoll_server:latest
+
+
+
+工程化和CI/CD：（任务20在另外的文件夹里面）
+我学习到了本地化git、如何将本地仓库上传到github、配置makefile文件、设置github actions工作流
+
+本地仓库初始化git：
+git init
+
+上传到github仓库
+git add .
+git commit -m "update"
+git push
+
+配置makefile文件
+make        # 编译 server 和 client
+make server # 只编译 server
+make clean  # 删除生成的可执行文件
+
+工作流：
+GitHub 规定：
+仓库目录
+└── .github
+    └── workflows
+        └── xxx.yml
+只要 YAML 文件放在这个目录里：.github/workflows/。GitHub 就会把它当作 workflow 配置文件。
+
+一个 workflow 通常包含四部分：
+name
+trigger (on)
+jobs
+steps
