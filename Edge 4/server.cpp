@@ -1,55 +1,65 @@
-#include <iostream>
+#include <mutex>
+#include <queue>
 #include <vector>
 #include <thread>
-#include <mutex>
 #include <atomic>
 #include <chrono>
-#include <queue>
-#include <functional>
-#include <condition_variable>
 #include <sstream>
 #include <fstream>
 #include <csignal>
-#include <unistd.h>
 #include <fcntl.h>
-#include <cstring>
+#include <iostream>
+#include <unistd.h>
+#include <functional>
 #include <unordered_map>
+#include <condition_variable>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <arpa/inet.h>
+#include <sys/epoll.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <sys/epoll.h>
-#include <sys/stat.h>
 #include <nlohmann/json.hpp>
-#include <sys/wait.h>
-#include <sys/types.h>
 
 using json = nlohmann::json;
 using namespace std;
 
+// 默认配置
 struct Config {
+    // 线程数
     int thread_num = 4;
+    // 服务器端口
     int server_port = 8080;
+    // 日志文件
     string log_file = "server.log";
+    // 监控线程和配置热更新的轮询间隔
     int monitor_interval = 1000;
+    // 日志 buffer 的预分配容量
     int log_batch = 256;
+    // 日志后台线程的最长等待时间
     int log_flush = 50;
 
-    double cpu_warn = 80.0;
-    double cpu_error = 120.0;
+    // 用于运维的分等级数值
+    double cpu_warn = 100.0;
+    double cpu_error = 180.0;
     double mem_warn = 100.0;
     double mem_error = 200.0;
-    int tps_warn = 10000;
-    int tps_error = 20000;
+    int tps_warn = 20000;
+    int tps_error = 40000;
 };
 
+// 日志消息等级
 enum class LogLevel {
     DEBUG = 0, INFO = 1, WARN = 2, ERROR = 3
 };
 
+// 异步日志
 class AsyncLogger {
 private:
+    // 双缓冲区
     vector<string> buffer1, buffer2;
     atomic<bool> swap_flag{false};
+
     mutex mtx;
     condition_variable cv;
     atomic<bool> running{true};
@@ -58,43 +68,9 @@ private:
     atomic<LogLevel> level;
     size_t batch;
     int flush_ms;
-    bool shutdown_called{false};
 
 public:
-    string now_time() {
-        auto now = chrono::system_clock::now();
-        time_t t = chrono::system_clock::to_time_t(now);
-        tm tm_buf{};
-        localtime_r(&t, &tm_buf);
-        char buf[32];
-        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
-        return string(buf);
-    }
-
-    void process() {
-        vector<string> *current, *back;
-        while (running || !buffer1.empty() || !buffer2.empty()) {
-            {
-                unique_lock<mutex> lock(mtx);
-                cv.wait_for(lock, chrono::milliseconds(flush_ms), [this]() {
-                    return !buffer1.empty() || !buffer2.empty() || !running;
-                });
-                swap_flag = !swap_flag;
-                if (swap_flag) { current = &buffer1; back = &buffer2; }
-                else           { current = &buffer2; back = &buffer1; }
-                current->swap(*back);
-            }
-            for (auto &line : *current) {
-                cout << line << "\n";
-                if (fout.is_open()) fout << line << "\n";
-            }
-            if (fout.is_open()) fout.flush();
-            current->clear();
-        }
-    }
-
-    AsyncLogger(const string &filename, LogLevel lvl = LogLevel::INFO,
-                size_t batch_size = 256, int flush_interval = 50)
+    AsyncLogger(const string &filename, LogLevel lvl = LogLevel::INFO, size_t batch_size = 256, int flush_interval = 50)
         : batch(batch_size), flush_ms(flush_interval), level(lvl)
     {
         fout.open(filename, ios::app);
@@ -108,18 +84,71 @@ public:
 
     ~AsyncLogger() { shutdown(); }
 
+    string now_time() {
+        auto now = chrono::system_clock::now();
+        time_t t = chrono::system_clock::to_time_t(now);
+        tm tm_buf{};
+        localtime_r(&t, &tm_buf);
+        char buf[32];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
+        return string(buf);
+    }
+
+    // 双缓冲机制
+    void process() {
+        vector<string> *current, *back;
+        // 保证优雅退出，不丢日志
+        while (running || !buffer1.empty() || !buffer2.empty()) {
+            {
+                unique_lock<mutex> lock(mtx);
+                cv.wait_for(lock, chrono::milliseconds(flush_ms), [this]() {
+                    return !buffer1.empty() || !buffer2.empty() || !running;
+                });
+                swap_flag = !swap_flag;
+                if (swap_flag) { 
+                    current = &buffer1; 
+                    back = &buffer2; 
+                }
+                else { 
+                    current = &buffer2; 
+                    back = &buffer1; 
+                }
+                current->swap(*back);
+            }
+            for (auto &line : *current) {
+                cout << line << "\n";
+                if (fout.is_open()) {
+                    fout << line << "\n";
+                }
+            }
+            if (fout.is_open()) {
+                fout.flush();
+            }
+            current->clear();
+        }
+    }
+
     void shutdown() {
-        if (shutdown_called) return;
-        shutdown_called = true;
+        if (!running) {
+            return;
+        }
         running = false;
         cv.notify_all();
-        if (worker.joinable()) worker.join();
-        if (fout.is_open()) fout.close();
+        if (worker.joinable()) {
+            worker.join();
+        }
+        if (fout.is_open()) {
+            fout.close();
+        }
     }
 
     void log(LogLevel lvl, const string &msg) {
-        if (lvl < level.load()) return;
-        if (!running) return;
+        if (lvl < level.load()) {
+            return;
+        }
+        if (!running) {
+            return;
+        }
         const char* lvl_str = "";
         switch (lvl) {
             case LogLevel::DEBUG: lvl_str = "DEBUG"; break;
@@ -130,8 +159,12 @@ public:
         string line = "[" + now_time() + "][" + lvl_str + "] " + msg;
         {
             lock_guard<mutex> lock(mtx);
-            if (swap_flag) buffer1.push_back(move(line));
-            else           buffer2.push_back(move(line));
+            if (swap_flag) {
+                buffer1.push_back(move(line));
+            }
+            else {
+                buffer2.push_back(move(line));
+            }
         }
         cv.notify_one();
     }
@@ -146,78 +179,121 @@ public:
 static AsyncLogger* g_logger = nullptr;
 
 inline void glog(LogLevel lvl, const string& msg) {
-    if (g_logger) g_logger->log(lvl, msg);
+    if (g_logger) {
+        g_logger->log(lvl, msg);
+    }
 }
 
+// 线程池
 class ThreadPool {
 private:
+    // 线程池
     vector<thread> workers;
+    // 任务列表
     queue<function<void()>> tasks;
     mutex queueMutex;
     condition_variable condvar;
     atomic<bool> running{true};
+    // 配置的目标线程数
     atomic<size_t> target_thread_num;
 
 public:
     ThreadPool(size_t threadNum) : target_thread_num(threadNum) {
         resize(threadNum);
     }
-    ~ThreadPool() { shutdown(); }
 
+    ~ThreadPool() { 
+        shutdown(); 
+    }
+
+    // 提交一个新任务
     void submit(function<void()> task) {
         lock_guard<mutex> lock(queueMutex);
-        if (!running) return;
+        if (!running) {
+            return;
+        }
         tasks.push(move(task));
         condvar.notify_one();
     }
 
+    // 更新线程数
     void resize(size_t newSize) {
         target_thread_num = newSize;
         lock_guard<mutex> lock(queueMutex);
-        for (size_t i = workers.size(); i < newSize; ++i)
-            workers.emplace_back([this]() { worker_loop(); });
+        for (size_t i = workers.size(); i < newSize; ++i){
+            workers.emplace_back([this]() { 
+                worker_loop(); 
+            });
+        }
         glog(LogLevel::INFO, "[ThreadPool] resized to " + to_string(newSize) + " threads");
     }
 
     void shutdown() {
         {
             lock_guard<mutex> lock(queueMutex);
-            if (!running) return;
+            if (!running) {
+                return;
+            }
             running = false;
         }
         condvar.notify_all();
-        for (auto &t : workers) if (t.joinable()) t.join();
+        for (auto &t : workers) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
         workers.clear();
     }
 
+    // 实现线程池的扩缩容
     void worker_loop() {
         while (true) {
+            // 这里使用while(true)而不是while(running)可以保证将任务列表中的任务全部结束之后才会终止
             function<void()> task;
             {
                 unique_lock<mutex> lock(queueMutex);
-                condvar.wait(lock, [this]() { return !tasks.empty() || !running; });
-                if (!running && tasks.empty()) return;
-                if (workers.size() > target_thread_num) return;
-                if (!tasks.empty()) { task = move(tasks.front()); tasks.pop(); }
+                condvar.wait(lock, [this]() { 
+                    return !tasks.empty() || !running; 
+                });
+                if (!running && tasks.empty()) {
+                    return;
+                }
+                if (workers.size() > target_thread_num) {
+                    return;
+                }
+                if (!tasks.empty()) { 
+                    task = move(tasks.front()); 
+                    tasks.pop(); 
+                }
             }
             if (task) {
-                try { task(); }
-                catch (const exception &e) { glog(LogLevel::ERROR, "[Worker] " + string(e.what())); }
-                catch (...) { glog(LogLevel::ERROR, "[Worker] unknown exception"); }
+                try { 
+                    task(); 
+                }
+                catch (const exception &e) { 
+                    glog(LogLevel::ERROR, "[Worker] " + string(e.what())); 
+                }
+                catch (...) { 
+                    glog(LogLevel::ERROR, "[Worker] unknown exception"); 
+                }
             }
         }
     }
 };
 
+// 设置为非阻塞模式，和ET搭配
 int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) return -1;
+    if (flags == -1) 
+        return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 class EpollServer {
 private:
+    // 监听套接字的文件描述符，专门用来accept()新连接的
     int listen_fd = -1;
+    // epoll 实例的文件描述符，内核用它来管理所有被监听的 fd
     int epfd = -1;
     ThreadPool &pool;
     atomic<bool> running{true};
@@ -254,14 +330,26 @@ public:
         while (running) {
             int n = epoll_wait(epfd, events.data(), events.size(), 500);
             if (n < 0) {
-                if (errno == EINTR) { if (!running) break; else continue; }
-                if (running) perror("epoll_wait");
+                if (errno == EINTR) { 
+                    if (!running) 
+                        break; 
+                    else 
+                        continue; 
+                }
+                if (running) {
+                    perror("epoll_wait");
+                }
                 break;
             }
             for (int i = 0; i < n; i++) {
                 int fd = events[i].data.fd;
-                if (fd == listen_fd) accept_client();
-                else handle_client(fd);
+                if (fd == listen_fd) {
+                    // 监听的有动静，说明有新连接
+                    accept_client();
+                }
+                else {
+                    handle_client(fd);
+                }
             }
         }
         // run() 退出时统一清理，不与 stop() 竞争
@@ -273,20 +361,33 @@ public:
             }
             buffers.clear();
         }
-        if (listen_fd >= 0) { close(listen_fd); listen_fd = -1; }
-        if (epfd >= 0)      { close(epfd);      epfd = -1; }
+        if (listen_fd >= 0) { 
+            close(listen_fd); 
+            listen_fd = -1; 
+        }
+        if (epfd >= 0) { 
+            close(epfd);     
+            epfd = -1; 
+        }
         glog(LogLevel::INFO, "[Server] stopped.");
     }
 
     // stop() 只设标志，资源清理全在 run() 里
-    void stop() { running = false; }
+    // 主要是因为 stop是主线程调用的，run是另外一个线程调用的
+    void stop() { 
+        running = false; 
+    }
 
     void accept_client() {
         while (true) {
             sockaddr_in client{};
             socklen_t len = sizeof(client);
             int cfd = accept(listen_fd, (sockaddr *)&client, &len);
-            if (cfd < 0) { if (errno == EAGAIN) break; continue; }
+            if (cfd < 0) { 
+                if (errno == EAGAIN) 
+                    break; 
+                continue; 
+            }
             set_nonblocking(cfd);
             epoll_event ev{};
             ev.events = EPOLLIN | EPOLLET;
@@ -307,13 +408,18 @@ public:
         while (true) {
             ssize_t n = read(fd, buf, sizeof(buf));
             if (n > 0) {
-                { lock_guard<mutex> lock(buffers_mtx); buffers[fd].append(buf, n); }
+                { 
+                    lock_guard<mutex> lock(buffers_mtx); 
+                    buffers[fd].append(buf, n); 
+                }
                 process_buffer(fd);
             } else if (n == 0) {
                 close_client(fd); break;
             } else {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                close_client(fd); break;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) 
+                    break;
+                close_client(fd); 
+                break;
             }
         }
     }
@@ -324,10 +430,12 @@ public:
             {
                 lock_guard<mutex> lock(buffers_mtx);
                 auto it = buffers.find(fd);
-                if (it == buffers.end()) break;
+                if (it == buffers.end()) 
+                    break;
                 auto &b = it->second;
                 size_t pos = b.find('\n');
-                if (pos == string::npos) break;
+                if (pos == string::npos) 
+                    break;
                 msg = b.substr(0, pos);
                 b.erase(0, pos + 1);
             }
@@ -335,16 +443,20 @@ public:
             total_tps++;
             pool.submit([fd, msg]() {
                 stringstream ss; ss << this_thread::get_id();
-                glog(LogLevel::DEBUG, "[Worker] thread=" + ss.str() +
-                     " fd=" + to_string(fd) + " msg=" + msg);
+                glog(LogLevel::DEBUG, "[Worker] thread=" + ss.str() + " fd=" + to_string(fd) + " msg=" + msg);
             });
             string echo = msg + "\n";
             write(fd, echo.c_str(), echo.size());
         }
     }
 
-    int get_tps()           { return tps.exchange(0); }
-    int64_t get_total_tps() { return total_tps.load(); }
+    int get_tps() { 
+        return tps.exchange(0); 
+    }
+
+    int64_t get_total_tps() { 
+        return total_tps.load(); 
+    }
 };
 
 void monitor(EpollServer &server, atomic<bool> &running, Config &cfg) {
@@ -352,11 +464,16 @@ void monitor(EpollServer &server, atomic<bool> &running, Config &cfg) {
     auto lastCheck = chrono::steady_clock::now();
     while (running) {
         this_thread::sleep_for(chrono::milliseconds(cfg.monitor_interval));
-        if (!running) break;
+        if (!running) {
+            break;
+        }
 
         ifstream fstat("/proc/self/stat");
-        string tmp; uint64_t utime = 0, stime = 0;
-        for (int i = 0; i < 13; i++) fstat >> tmp;
+        string tmp; 
+        uint64_t utime = 0, stime = 0;
+        for (int i = 0; i < 13; i++) {
+            fstat >> tmp;
+        }
         fstat >> utime >> stime;
         uint64_t totalTime = utime + stime;
 
@@ -368,26 +485,40 @@ void monitor(EpollServer &server, atomic<bool> &running, Config &cfg) {
         lastTotalTime = totalTime; lastCheck = now;
 
         ifstream fstatus("/proc/self/status");
-        string line; size_t memKB = 0;
-        while (getline(fstatus, line))
+        string line; 
+        size_t memKB = 0;
+        while (getline(fstatus, line)){
             if (line.find("VmRSS:") != string::npos) {
                 stringstream ss(line); string key; ss >> key >> memKB;
             }
+        }
 
         int cur_tps = server.get_tps();
         stringstream ss;
         ss << "[Monitor] CPU=" << cpuUsage << "% Mem=" << memKB/1024.0 << "MB TPS=" << cur_tps;
         glog(LogLevel::INFO, ss.str());
 
-        if      (cpuUsage >= cfg.cpu_error) glog(LogLevel::ERROR, "[ALARM] CPU too high: " + to_string(cpuUsage) + "%");
-        else if (cpuUsage >= cfg.cpu_warn)  glog(LogLevel::WARN,  "[ALARM] CPU warning: "  + to_string(cpuUsage) + "%");
+        if(cpuUsage >= cfg.cpu_error) {
+            glog(LogLevel::ERROR, "[ALARM] CPU too high: " + to_string(cpuUsage) + "%");
+        }
+        else if (cpuUsage >= cfg.cpu_warn) {
+            glog(LogLevel::WARN,  "[ALARM] CPU warning: "  + to_string(cpuUsage) + "%");
+        }
 
         double memMB = memKB/1024.0;
-        if      (memMB >= cfg.mem_error) glog(LogLevel::ERROR, "[ALARM] Mem too high: " + to_string(memMB) + "MB");
-        else if (memMB >= cfg.mem_warn)  glog(LogLevel::WARN,  "[ALARM] Mem warning: "  + to_string(memMB) + "MB");
+        if(memMB >= cfg.mem_error) {
+            glog(LogLevel::ERROR, "[ALARM] Mem too high: " + to_string(memMB) + "MB");
+        }
+        else if (memMB >= cfg.mem_warn){
+            glog(LogLevel::WARN,  "[ALARM] Mem warning: "  + to_string(memMB) + "MB");
+        }
 
-        if      (cur_tps >= cfg.tps_error) glog(LogLevel::ERROR, "[ALARM] TPS too high: " + to_string(cur_tps));
-        else if (cur_tps >= cfg.tps_warn)  glog(LogLevel::WARN,  "[ALARM] TPS warning: "  + to_string(cur_tps));
+        if (cur_tps >= cfg.tps_error) {
+            glog(LogLevel::ERROR, "[ALARM] TPS too high: " + to_string(cur_tps));
+        }
+        else if (cur_tps >= cfg.tps_warn) {
+            glog(LogLevel::WARN,  "[ALARM] TPS warning: "  + to_string(cur_tps));
+        }
     }
 }
 
@@ -398,16 +529,20 @@ private:
     atomic<bool> running{true};
     ThreadPool *pool;
     time_t last_mtime{0};
+
 public:
     ConfigManager(const string &file, Config *c, ThreadPool *p)
         : filename(file), cfg(c), pool(p) {}
 
-    void stop() { running = false; }
+    void stop() { 
+        running = false; 
+    }
 
     void watch_loop() {
         while (running) {
             this_thread::sleep_for(chrono::milliseconds(cfg->monitor_interval));
-            if (!running) break;
+            if (!running) 
+                break;
             struct stat st;
             if (stat(filename.c_str(), &st) == 0 && st.st_mtime != last_mtime) {
                 last_mtime = st.st_mtime;
@@ -420,7 +555,9 @@ public:
         ifstream f(filename);
         if (!f.is_open()) return;
         json j;
-        try { f >> j; } catch (...) {
+        try { 
+            f >> j; 
+        } catch (...) {
             glog(LogLevel::WARN, "[ConfigManager] failed to parse config");
             return;
         }
@@ -436,7 +573,7 @@ public:
         if (j.contains("log_level") && g_logger) {
             string lvl = j["log_level"];
             LogLevel newLvl = LogLevel::INFO;
-            if      (lvl == "DEBUG") newLvl = LogLevel::DEBUG;
+            if (lvl == "DEBUG") newLvl = LogLevel::DEBUG;
             else if (lvl == "WARN")  newLvl = LogLevel::WARN;
             else if (lvl == "ERROR") newLvl = LogLevel::ERROR;
             g_logger->set_level(newLvl);
@@ -444,7 +581,6 @@ public:
     }
 };
 
-// ---- 子进程信号标志 ----
 static atomic<bool> g_child_quit{false};
 
 void child_signal_handler(int) {
@@ -469,7 +605,9 @@ int run_server() {
     thread mon_thread(monitor, ref(server), ref(monitor_running), ref(cfg));
 
     ConfigManager cfgMgr("config.json", &cfg, &pool);
-    thread cfg_thread([&]() { cfgMgr.watch_loop(); });
+    thread cfg_thread([&]() { 
+        cfgMgr.watch_loop(); 
+    });
 
     while (!g_child_quit)
         this_thread::sleep_for(chrono::milliseconds(100));
@@ -478,13 +616,19 @@ int run_server() {
 
     // 正确顺序：cfg → monitor → server(epoll停止+join) → pool → logger
     cfgMgr.stop();
-    if (cfg_thread.joinable()) cfg_thread.join();
+    if (cfg_thread.joinable()) {
+        cfg_thread.join();
+    }
 
     monitor_running = false;
-    if (mon_thread.joinable()) mon_thread.join();
+    if (mon_thread.joinable()) {
+        mon_thread.join();
+    }
 
     server.stop();
-    if (server_thread.joinable()) server_thread.join();
+    if (server_thread.joinable()) {
+        server_thread.join();
+    }
 
     pool.shutdown();
 
@@ -493,7 +637,7 @@ int run_server() {
     glog(LogLevel::INFO, "Server exited gracefully.");
 
     g_logger = nullptr;
-    logger.shutdown(); // 手动提前关闭，析构时 shutdown_called==true 不会重复执行
+    logger.shutdown();
 
     return 0;
 }
@@ -502,7 +646,8 @@ int run_server() {
 static pid_t g_child_pid = 0;
 
 void watchdog_signal_handler(int sig) {
-    if (g_child_pid > 0) kill(g_child_pid, sig);
+    if (g_child_pid > 0) 
+        kill(g_child_pid, sig);
 }
 
 int main() {
