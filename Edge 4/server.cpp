@@ -65,6 +65,7 @@ private:
     atomic<bool> running{true};
     thread worker;
     ofstream fout;
+    string filename;
     atomic<LogLevel> level;
     size_t batch;
     int flush_ms;
@@ -73,6 +74,8 @@ public:
     AsyncLogger(const string &filename, LogLevel lvl = LogLevel::INFO, size_t batch_size = 256, int flush_interval = 50)
         : batch(batch_size), flush_ms(flush_interval), level(lvl)
     {
+        // fout.open(filename, ios::app);
+        this->filename = filename;
         fout.open(filename, ios::app);
         buffer1.reserve(batch * 2);
         buffer2.reserve(batch * 2);
@@ -97,7 +100,8 @@ public:
     // 双缓冲机制
     void process() {
         vector<string> *current, *back;
-        // 保证优雅退出，不丢日志
+        int log_line_count = 0;
+        const int max_lines = 1000;
         while (running || !buffer1.empty() || !buffer2.empty()) {
             {
                 unique_lock<mutex> lock(mtx);
@@ -119,6 +123,12 @@ public:
                 cout << line << "\n";
                 if (fout.is_open()) {
                     fout << line << "\n";
+                    log_line_count++;
+                    if (log_line_count >= max_lines) {
+                        fout.close();
+                        fout.open(filename, ios::trunc);
+                        log_line_count = 0;
+                    }
                 }
             }
             if (fout.is_open()) {

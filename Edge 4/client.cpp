@@ -24,8 +24,7 @@ void client_worker(const string &ip, int port, int id, int message_count, int ti
     sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
-
+    inet_pton(AF_INET, ip.c_str(), &server_addr.sin_addr);
     if(connect(sock, (sockaddr*)&server_addr, sizeof(server_addr)) < 0){
         perror("connect error.");
         close(sock);
@@ -57,7 +56,7 @@ int main(){
 
     vector<thread> workers;
     for(int i = 1; i <= threads; i++){
-        workers.emplace_back(client_worker, "127.0.0.1", 8080, i, message_count, time);
+        workers.emplace_back(client_worker, "188.166.186.248", 8080, i, message_count, time);
     }
 
     thread monitor([&](){
