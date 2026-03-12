@@ -56,7 +56,7 @@ int main(){
 
     vector<thread> workers;
     for(int i = 1; i <= threads; i++){
-        workers.emplace_back(client_worker, "188.166.186.248", 8080, i, message_count, time);
+        workers.emplace_back(client_worker, "47.102.196.235", 8080, i, message_count, time);
     }
 
     thread monitor([&](){
