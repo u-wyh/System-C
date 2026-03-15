@@ -1,0 +1,9 @@
+{
+    "thread_num": 4,
+    "log_level": "INFO",
+
+    "ai_api_key":    "",
+    "ai_model":      "qwen-math-turbo",
+    "ai_timeout_s":  30,
+    "system_prompt": "You are a helpful assistant. Reply concisely."
+}
