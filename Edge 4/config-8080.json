@@ -1,7 +1,7 @@
 {
     "thread_num": 4,
     "server_port": 8080,
-    "log_file": "server.log",
+    "log_file": "server-8080.log",
     "monitor_interval": 1000,
     "log_batch": 256,
     "log_flush": 50,
