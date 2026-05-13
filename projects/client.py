@@ -19,7 +19,7 @@ try:
             if not chunk:
                 break
             reply += chunk
-        print("AI:", reply.decode('utf-8').strip())
+        print("Echo:", reply.decode('utf-8').strip())
 except KeyboardInterrupt:
     print("\n断开连接")
 finally:

@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <iconv.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -21,6 +22,9 @@
 #include <unordered_map>
 #include <vector>
 
+#define CPPHTTPLIB_OPENSSL_SUPPORT
+#include "httplib.h"
+
 using json = nlohmann::json;
 using namespace std;
 
@@ -38,6 +42,16 @@ struct Config {
     double mem_error = 200.0;
     int tps_warn = 20000;
     int tps_error = 40000;
+
+    // AI接口配置，从config.json读取
+    string ai_api_key = "";
+    string ai_model = "qwen-turbo";
+    string ai_base_url = "dashscope.aliyuncs.com";
+    string ai_path = "/compatible-mode/v1/chat/completions";
+    int ai_timeout_s = 30;
+    int ai_max_concurrent = 8;
+    int ai_max_history = 10;
+    string system_prompt = "You are a helpful assistant. Reply concisely.";
 };
 
 enum class LogLevel { 
@@ -243,9 +257,192 @@ public:
     }
 };
 
+// 信号量，用于限制并发AI请求数
+class AiSemaphore {
+private:
+    mutex mtx;
+    condition_variable cv;
+    int count;
+    int max_count;
+
+public:
+    explicit AiSemaphore(int n) : count(n), max_count(n) {}
+
+    bool try_acquire() {
+        lock_guard<mutex> lock(mtx);
+        if (count <= 0) return false;
+        count--;
+        return true;
+    }
+
+    void release() {
+        lock_guard<mutex> lock(mtx);
+        count++;
+        cv.notify_one();
+    }
+
+    int available() {
+        lock_guard<mutex> lock(mtx);
+        return count;
+    }
+
+    void set_max(int n) {
+        lock_guard<mutex> lock(mtx);
+        count += (n - max_count);
+        max_count = n;
+        cv.notify_all();
+    }
+};
+
+static AiSemaphore* g_ai_sem = nullptr;
+
+class AiClient {
+public:
+    // 纯ASCII直接返回；否则尝试GBK->UTF-8转换（兼容telnet客户端）
+    static string to_utf8(const string& s) {
+        bool is_ascii = true;
+        for (unsigned char c : s) {
+            if (c >= 0x80) {
+                is_ascii = false;
+                break;
+            }
+        }
+        if (is_ascii) return s;
+
+        iconv_t cd = iconv_open("UTF-8", "GBK");
+        if (cd != (iconv_t)-1) {
+            string out;
+            out.resize(s.size() * 3);
+            char* in_buf = const_cast<char*>(s.c_str());
+            char* out_buf = &out[0];
+            size_t in_left = s.size();
+            size_t out_left = out.size();
+            size_t ret = iconv(cd, &in_buf, &in_left, &out_buf, &out_left);
+            iconv_close(cd);
+            if (ret != (size_t)-1) {
+                out.resize(out.size() - out_left);
+                return out;
+            }
+        }
+
+        if (is_valid_utf8(s)) return s;
+        return sanitize_utf8(s);
+    }
+
+    static bool is_valid_utf8(const string& s) {
+        size_t i = 0;
+        while (i < s.size()) {
+            unsigned char c = s[i];
+            int bytes = 0;
+            if (c < 0x80)
+                bytes = 1;
+            else if ((c & 0xE0) == 0xC0)
+                bytes = 2;
+            else if ((c & 0xF0) == 0xE0)
+                bytes = 3;
+            else if ((c & 0xF8) == 0xF0)
+                bytes = 4;
+            else
+                return false;
+            if (i + bytes > s.size()) return false;
+            for (int b = 1; b < bytes; b++)
+                if ((s[i + b] & 0xC0) != 0x80) return false;
+            i += bytes;
+        }
+        return true;
+    }
+
+    // 过滤非法字节，兜底用
+    static string sanitize_utf8(const string& s) {
+        string out;
+        out.reserve(s.size());
+        size_t i = 0;
+        while (i < s.size()) {
+            unsigned char c = s[i];
+            int bytes = 0;
+            if (c < 0x80)
+                bytes = 1;
+            else if ((c & 0xE0) == 0xC0)
+                bytes = 2;
+            else if ((c & 0xF0) == 0xE0)
+                bytes = 3;
+            else if ((c & 0xF8) == 0xF0)
+                bytes = 4;
+            else {
+                i++;
+                continue;
+            }
+            if (i + bytes > s.size()) break;
+            bool valid = true;
+            for (int b = 1; b < bytes; b++)
+                if ((s[i + b] & 0xC0) != 0x80) {
+                    valid = false;
+                    break;
+                }
+            if (valid) out.append(s, i, bytes);
+            i += bytes;
+        }
+        return out;
+    }
+
+    static string ask(const string& user_msg, const Config& cfg,vector<json>& history) {
+        if (g_ai_sem && !g_ai_sem->try_acquire()) {
+            glog(LogLevel::WARN, "[AiClient] rate limit reached");
+            return "服务繁忙，请稍后再试。";
+        }
+
+        struct SemGuard {
+            ~SemGuard() {
+                if (g_ai_sem) g_ai_sem->release();
+            }
+        } sem_guard;
+
+        string clean_msg = to_utf8(user_msg);
+        if (clean_msg.empty()) return "消息包含无法识别的字符，请重新发送。";
+
+        // 构造messages数组，带上历史上下文
+        json messages = json::array();
+        messages.push_back( {{"role", "system"}, {"content", cfg.system_prompt}});
+        for (auto& h : history) messages.push_back(h);
+        messages.push_back({{"role", "user"}, {"content", clean_msg}});
+
+        json body = {{"model", cfg.ai_model}, {"messages", messages}};
+
+        httplib::SSLClient cli(cfg.ai_base_url);
+        cli.set_connection_timeout(cfg.ai_timeout_s);
+        cli.set_read_timeout(cfg.ai_timeout_s);
+        cli.enable_server_certificate_verification(false);
+
+        httplib::Headers headers = {
+            {"Authorization", "Bearer " + cfg.ai_api_key},
+            {"Content-Type", "application/json"}};
+
+        auto res = cli.Post(cfg.ai_path, headers, body.dump(), "application/json");
+
+        if (!res) {
+            string err = httplib::to_string(res.error());
+            glog(LogLevel::ERROR, "[AiClient] HTTP error: " + err);
+            return "[Error] Failed to reach AI API: " + err;
+        }
+        if (res->status != 200) {
+            glog(LogLevel::ERROR, "[AiClient] HTTP " + to_string(res->status) + " " + res->body);
+            return "[Error] AI API returned HTTP " + to_string(res->status);
+        }
+
+        try {
+            auto j = json::parse(res->body);
+            return j["choices"][0]["message"]["content"].get<string>();
+        } catch (const exception& e) {
+            glog(LogLevel::ERROR, "[AiClient] parse error: " + string(e.what()) + " body=" + res->body);
+            return "[Error] Failed to parse AI response";
+        }
+    }
+};
+
 struct ClientContext {
     string recv_buf;
     bool busy = false;
+    vector<json> history;  // 多轮对话历史
 };
 
 int set_nonblocking(int fd) {
@@ -259,6 +456,7 @@ private:
     int listen_fd = -1;
     int epfd = -1;
     ThreadPool& pool;
+    Config& cfg;
     atomic<bool> running{true};
 
     mutex clients_mtx;
@@ -267,25 +465,8 @@ private:
     atomic<int> tps{0};
     atomic<int64_t> total_tps{0};
 
-    bool send_line(int fd, const string& out) {
-        ssize_t total = static_cast<ssize_t>(out.size());
-        ssize_t sent = 0;
-        while (sent < total) {
-            ssize_t n = send(fd, out.c_str() + sent, total - sent, MSG_NOSIGNAL);
-            if (n > 0) {
-                sent += n;
-                continue;
-            }
-            if (n < 0 && errno == EINTR) {
-                continue;
-            }
-            return false;
-        }
-        return true;
-    }
-
 public:
-    EpollServer(int port, ThreadPool& tp) : pool(tp) {
+    EpollServer(int port, ThreadPool& tp, Config& c) : pool(tp), cfg(c) {
         listen_fd = socket(AF_INET, SOCK_STREAM, 0);
         int opt = 1;
         setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -427,6 +608,7 @@ public:
             total_tps++;
 
             pool.submit([this, fd, msg]() {
+                // RAII保证busy一定被重置，防止连接卡死
                 auto reset_busy = [&]() {
                     lock_guard<mutex> lock(clients_mtx);
                     auto it = clients.find(fd);
@@ -434,19 +616,56 @@ public:
                 };
 
                 glog(LogLevel::INFO,
-                     "[Echo] fd=" + to_string(fd) + " message=" + msg);
+                     "[AI] fd=" + to_string(fd) + " question=" + msg);
+
+                // 持锁拷贝history，避免长时间持锁等待AI
+                vector<json> history_snapshot;
+                {
+                    lock_guard<mutex> lock(clients_mtx);
+                    auto it = clients.find(fd);
+                    if (it != clients.end())
+                        history_snapshot = it->second.history;
+                }
+
+                string reply;
+                try {
+                    reply = AiClient::ask(msg, cfg, history_snapshot);
+                } catch (...) {
+                    reply = "[Error] Internal error";
+                }
+
+                glog(LogLevel::INFO,
+                     "[AI] fd=" + to_string(fd) + " answer=" + reply);
+
+                // 更新对话历史并写回
+                if (reply.substr(0, 7) != "[Error]" &&
+                    reply != "服务繁忙，请稍后再试。") {
+                    history_snapshot.push_back({{"role", "user"}, {"content", msg}});
+                    history_snapshot.push_back({{"role", "assistant"}, {"content", reply}});
+
+                    int max_turns = cfg.ai_max_history * 2;
+                    while ((int)history_snapshot.size() > max_turns)
+                        history_snapshot.erase(history_snapshot.begin(),history_snapshot.begin() + 2);
+
+                    lock_guard<mutex> lock(clients_mtx);
+                    auto it = clients.find(fd);
+                    if (it != clients.end())
+                        it->second.history = move(history_snapshot);
+                }
+
+                string out = reply + "\n";
 
                 {
                     lock_guard<mutex> lock(clients_mtx);
                     if (clients.find(fd) == clients.end()) return;
                 }
 
-                string out = msg + "\n";
-                if (!send_line(fd, out)) {
-                    glog(LogLevel::WARN,
-                         "[Echo] send failed, closing fd=" + to_string(fd));
-                    close_client(fd);
-                    return;
+                ssize_t total = static_cast<ssize_t>(out.size());
+                ssize_t sent = 0;
+                while (sent < total) {
+                    ssize_t n = write(fd, out.c_str() + sent, total - sent);
+                    if (n <= 0) break;
+                    sent += n;
                 }
 
                 reset_busy();
@@ -577,6 +796,20 @@ public:
                 newLvl = LogLevel::ERROR;
             g_logger->set_level(newLvl);
         }
+
+        if (j.contains("ai_api_key")) cfg->ai_api_key = j["ai_api_key"];
+        if (j.contains("ai_model")) cfg->ai_model = j["ai_model"];
+        if (j.contains("ai_timeout_s")) cfg->ai_timeout_s = j["ai_timeout_s"];
+        if (j.contains("system_prompt")) cfg->system_prompt = j["system_prompt"];
+        if (j.contains("ai_max_history")) cfg->ai_max_history = j["ai_max_history"];
+        if (j.contains("ai_max_concurrent") && g_ai_sem) {
+            int n = j["ai_max_concurrent"];
+            if (n != cfg->ai_max_concurrent) {
+                glog(LogLevel::INFO, "[ConfigManager] ai_max_concurrent: " + to_string(cfg->ai_max_concurrent) + " -> " + to_string(n));
+                g_ai_sem->set_max(n);
+                cfg->ai_max_concurrent = n;
+            }
+        }
     }
 };
 
@@ -589,15 +822,19 @@ int run_server() {
 
     signal(SIGINT, child_signal_handler);
     signal(SIGTERM, child_signal_handler);
-    signal(SIGPIPE, SIG_IGN);
 
     Config cfg;
+
+    // 启动时读一次配置，拿到api_key
     {
         ifstream f("config.json");
         if (f.is_open()) {
             json j;
             try {
                 f >> j;
+                if (j.contains("ai_api_key")) cfg.ai_api_key = j["ai_api_key"];
+                if (j.contains("ai_model")) cfg.ai_model = j["ai_model"];
+                if (j.contains("system_prompt")) cfg.system_prompt = j["system_prompt"];
                 if (j.contains("thread_num")) cfg.thread_num = j["thread_num"];
             } catch (...) {
                 glog(LogLevel::WARN, "[Startup] failed to parse config.json");
@@ -605,8 +842,15 @@ int run_server() {
         }
     }
 
+    if (cfg.ai_api_key.empty())
+        glog(LogLevel::WARN,
+             "[Startup] ai_api_key is empty! Set it in config.json");
+
+    AiSemaphore ai_sem(cfg.ai_max_concurrent);
+    g_ai_sem = &ai_sem;
+
     ThreadPool pool(cfg.thread_num);
-    EpollServer server(cfg.server_port, pool);
+    EpollServer server(cfg.server_port, pool, cfg);
 
     thread server_thread([&]() { server.run(); });
 
@@ -638,6 +882,7 @@ int run_server() {
     }
 
     pool.shutdown();
+    g_ai_sem = nullptr;
 
     cout << "[Server] Total requests: " << server.get_total_tps() << endl;
     glog(LogLevel::INFO, "[Server] Total requests: " + to_string(server.get_total_tps()));
@@ -696,4 +941,6 @@ int main() {
     }
     return 0;
 }
-// g++ -O2 -std=c++17 server.cpp -o echo_server -lpthread
+// g++ -O2 -std=c++17 server.cpp -o ai_server \
+//     -lssl -lcrypto -lpthread \
+//     -DCPPHTTPLIB_OPENSSL_SUPPORT
