@@ -5,7 +5,7 @@
     "monitor_interval": 1000,
     "log_batch": 256,
     "log_flush": 50,
-    "cpu_warn": 100.0,
+    "cpu_warn": 80.0,
     "cpu_error": 180.0,
     "mem_warn": 100.0,
     "mem_error": 200.0,
