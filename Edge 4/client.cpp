@@ -13,8 +13,8 @@
 using namespace std;
 
 struct Options {
-    string host = "188.166.186.248";
-    int port = 8080;
+    string host = "127.0.0.1";
+    int port = 8081;
     int clients = 500;
     int messages_per_client = 2000;
     int interval_ms = 2;

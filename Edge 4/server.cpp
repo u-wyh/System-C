@@ -50,6 +50,15 @@ struct Config {
     string log_level = "INFO";
 };
 
+struct RuntimeOptions {
+    string config_path = "config.json";
+    bool use_watchdog = true;
+    bool port_override = false;
+    int server_port = 8080;
+    bool log_file_override = false;
+    string log_file;
+};
+
 LogLevel parse_log_level(const string& text) {
     if (text == "DEBUG") return LogLevel::DEBUG;
     if (text == "WARN") return LogLevel::WARN;
@@ -88,8 +97,12 @@ bool load_config_file(const string& path, Config& cfg) {
 
 class AsyncLogger {
 private:
+    vector<string> buffer1, buffer2;
+    atomic<bool> swap_flag{false};
     mutex mtx;
+    condition_variable cv;
     atomic<bool> running{true};
+    thread worker;
     ofstream fout;
     string filename;
     atomic<LogLevel> level;
@@ -97,9 +110,10 @@ private:
 public:
     AsyncLogger(const string& file_name, LogLevel lvl, size_t batch_size, int flush_interval_ms)
         : filename(file_name), level(lvl) {
-        (void)batch_size;
-        (void)flush_interval_ms;
         fout.open(filename, ios::app);
+        buffer1.reserve(batch_size * 2);
+        buffer2.reserve(batch_size * 2);
+        worker = thread(&AsyncLogger::process, this, flush_interval_ms);
     }
 
     AsyncLogger(const AsyncLogger&) = delete;
@@ -119,9 +133,53 @@ public:
         return string(buf);
     }
 
+    void process(int flush_interval_ms) {
+        vector<string>* current = nullptr;
+        vector<string>* back = nullptr;
+        int log_line_count = 0;
+        const int max_lines = 1000;
+
+        while (running || !buffer1.empty() || !buffer2.empty()) {
+            {
+                unique_lock<mutex> lock(mtx);
+                cv.wait_for(lock, chrono::milliseconds(flush_interval_ms), [this]() {
+                    return !buffer1.empty() || !buffer2.empty() || !running;
+                });
+                swap_flag = !swap_flag;
+                if (swap_flag) {
+                    current = &buffer1;
+                    back = &buffer2;
+                } else {
+                    current = &buffer2;
+                    back = &buffer1;
+                }
+                current->swap(*back);
+            }
+
+            for (const auto& line : *current) {
+                if (fout.is_open()) {
+                    fout << line << "\n";
+                    if (++log_line_count >= max_lines) {
+                        fout.close();
+                        fout.open(filename, ios::trunc);
+                        log_line_count = 0;
+                    }
+                }
+            }
+            if (fout.is_open()) {
+                fout.flush();
+            }
+            current->clear();
+        }
+    }
+
     void shutdown() {
         if (!running.exchange(false)) {
             return;
+        }
+        cv.notify_all();
+        if (worker.joinable()) {
+            worker.join();
         }
         if (fout.is_open()) {
             fout.close();
@@ -142,12 +200,11 @@ public:
         }
 
         string line = "[" + now_time() + "][" + level_text + "] " + msg;
-        lock_guard<mutex> lock(mtx);
-        cout << line << "\n";
-        if (fout.is_open()) {
-            fout << line << "\n";
-            fout.flush();
+        {
+            lock_guard<mutex> lock(mtx);
+            (swap_flag ? buffer1 : buffer2).push_back(move(line));
         }
+        cv.notify_one();
     }
 
     void set_level(LogLevel lvl) {
@@ -600,10 +657,7 @@ void child_signal_handler(int) {
     g_child_quit = true;
 }
 
-int run_server(const string& config_path) {
-    Config cfg;
-    load_config_file(config_path, cfg);
-
+int run_server(Config cfg, const string& watch_config_path) {
     AsyncLogger logger(cfg.log_file, parse_log_level(cfg.log_level), cfg.log_batch, cfg.log_flush);
     g_logger = &logger;
 
@@ -619,7 +673,7 @@ int run_server(const string& config_path) {
     atomic<bool> monitor_running{true};
     thread monitor_thread(monitor, ref(server), ref(monitor_running), ref(cfg));
 
-    ConfigManager cfg_mgr(config_path, &cfg, &pool);
+    ConfigManager cfg_mgr(watch_config_path, &cfg, &pool);
     thread config_thread([&]() { cfg_mgr.watch_loop(); });
 
     while (!g_child_quit) {
@@ -645,7 +699,6 @@ int run_server(const string& config_path) {
 
     pool.shutdown();
 
-    cout << "[Server] Total requests: " << server.get_total_tps() << endl;
     glog(LogLevel::INFO, "[Server] Total requests: " + to_string(server.get_total_tps()));
     glog(LogLevel::INFO, "Server exited gracefully.");
 
@@ -663,22 +716,40 @@ void watchdog_signal_handler(int sig) {
 }
 
 int main(int argc, char* argv[]) {
-    string config_path = "config.json";
-    bool use_watchdog = true;
+    RuntimeOptions options;
 
     for (int i = 1; i < argc; ++i) {
         string arg = argv[i];
         if (arg == "--no-watchdog") {
-            use_watchdog = false;
+            options.use_watchdog = false;
+        } else if (arg == "--port" && i + 1 < argc) {
+            options.port_override = true;
+            options.server_port = stoi(argv[++i]);
+        } else if (arg == "--log-file" && i + 1 < argc) {
+            options.log_file_override = true;
+            options.log_file = argv[++i];
         } else {
-            config_path = arg;
+            options.config_path = arg;
         }
     }
 
-    if (!use_watchdog) {
+    Config cfg;
+    load_config_file(options.config_path, cfg);
+    if (options.port_override) {
+        cfg.server_port = options.server_port;
+    }
+    if (options.log_file_override) {
+        cfg.log_file = options.log_file;
+    }
+
+    auto run_with_config = [&]() {
         signal(SIGINT, child_signal_handler);
         signal(SIGTERM, child_signal_handler);
-        return run_server(config_path);
+        return run_server(cfg, options.config_path);
+    };
+
+    if (!options.use_watchdog) {
+        return run_with_config();
     }
 
     signal(SIGINT, watchdog_signal_handler);
@@ -696,7 +767,7 @@ int main(int argc, char* argv[]) {
             signal(SIGTERM, SIG_DFL);
             g_child_quit = false;
             g_logger = nullptr;
-            exit(run_server(config_path));
+            exit(run_with_config());
         }
 
         g_child_pid = pid;
